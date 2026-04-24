@@ -1,0 +1,20 @@
+{
+  "name": "Project with Claude Code",
+  "image": "mcr.microsoft.com/devcontainers/universal:latest",
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && echo '{\"theme\":\"dark\",\"hasCompletedOnboarding\":true,\"hasTrustDialogAccepted\":true,\"hasTrustDialogHooksAccepted\":true}' > ~/.claude.json && mkdir -p ~/.claude && echo $CLAUDE_AUTH_JSON > ~/.claude/.credentials.json",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code"
+      ],
+      "settings": {
+        "github.copilot.enable": {
+          "*": false
+        },
+        "github.copilot.editor.enableAutoCompletions": false,
+        "github.copilot.chat.enabled": false,
+        "chat.disableAIFeatures": true
+      }
+    }
+  }
+}
