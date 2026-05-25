@@ -24,8 +24,7 @@ class MPITrainer:
 
     def create_model(self, model_type='cnn', **kwargs):
         """Создание модели указанного типа"""
-        from .models import (MPIReconstructionCNN, MoDLNetwork, DiffusionModel,
-                           DiffusionUNet, CombinedHybridModel)
+        from .models import MPIReconstructionCNN, MoDLNetwork, DiffusionModel
 
         self.model_type = model_type
 
@@ -33,38 +32,23 @@ class MPITrainer:
             self.model = MPIReconstructionCNN(
                 input_channels=kwargs.get('input_channels', 4),
                 output_channels=kwargs.get('output_channels', 1),
-                base_filters=kwargs.get('base_filters', 64)  # Увеличили фильтры
+                base_filters=kwargs.get('base_filters', 32),
             )
         elif model_type == 'modl':
             self.model = MoDLNetwork(
                 system_matrix=kwargs.get('system_matrix'),
                 image_shape=kwargs.get('image_shape'),
-                n_iterations=kwargs.get('n_iterations', 5),
+                n_iterations=kwargs.get('n_iterations', 3),
                 lambda_param=kwargs.get('lambda_param', 0.01),
-                base_filters=kwargs.get('base_filters', 64)  # Полноценная архитектура
+                base_filters=kwargs.get('base_filters', 32),
             )
         elif model_type == 'diffusion':
-            # Полноценная диффузионная модель
-            denoiser = DiffusionUNet(
-                in_channels=2,
-                out_channels=1,
-                base_filters=kwargs.get('base_filters', 128),  # Увеличили
-                image_size=kwargs.get('image_size', 51),
-                time_embed_dim=256
-            )
             self.model = DiffusionModel(
-                denoiser=denoiser,
-                n_steps=kwargs.get('n_steps', 1000),
+                n_steps=kwargs.get('n_steps', 100),
+                image_size=kwargs.get('image_size', 51),
+                base_filters=kwargs.get('base_filters', 64),
                 beta_start=kwargs.get('beta_start', 1e-4),
-                beta_end=kwargs.get('beta_end', 0.02)
-            )
-        elif model_type == 'hybrid':
-            self.model = CombinedHybridModel(
-                system_matrix=kwargs.get('system_matrix'),
-                image_shape=kwargs.get('image_shape'),
-                modl_iterations=kwargs.get('modl_iterations', 5),
-                diffusion_steps=kwargs.get('diffusion_steps', 100),
-                base_filters=kwargs.get('base_filters', 64)
+                beta_end=kwargs.get('beta_end', 0.02),
             )
         else:
             raise ValueError(f"Unknown model type: {model_type}")
@@ -97,19 +81,10 @@ class MPITrainer:
             model_type_lower = str(self.model_type).lower() if self.model_type else ''
 
             if 'diffusion' in model_type_lower:
-                # Полноценное обучение диффузионной модели
-                if measurements.shape[-2:] != targets.shape[-2:]:
-                    measurements = F.interpolate(measurements, size=targets.shape[-2:],
-                                                 mode='bilinear', align_corners=False)
-
-                # Используем все каналы измерений как условие
-                condition = measurements  # (B, 4, H, W)
-
-                # Добавляем случайный dropout условий для робастности
-                if np.random.random() < 0.1:
-                    condition = torch.zeros_like(condition)
-
-                loss = self.model(targets, condition=condition)
+                # DDPM-обучение: модель сама добавляет шум к target и
+                # предсказывает его. Условие из measurements здесь не
+                # используется (диффузионный baseline безусловный).
+                loss = self.model(targets)
 
             else:
                 outputs = self.model(measurements)
@@ -139,11 +114,7 @@ class MPITrainer:
                 model_type_lower = str(self.model_type).lower() if self.model_type else ''
 
                 if 'diffusion' in model_type_lower:
-                    if measurements.shape[-2:] != targets.shape[-2:]:
-                        measurements = F.interpolate(measurements, size=targets.shape[-2:],
-                                                     mode='bilinear', align_corners=False)
-                    condition = measurements
-                    loss = self.model(targets, condition=condition)
+                    loss = self.model(targets)
                 else:
                     outputs = self.model(measurements)
                     loss = self.criterion(outputs, targets)
@@ -328,37 +299,16 @@ class ModelTrainerFactory:
         return trainer
 
     @staticmethod
-    def create_diffusion_trainer(n_steps=1000, learning_rate=1e-4, image_size=51,
-                                base_filters=128, beta_start=1e-4, beta_end=0.02):
-        from .models import DiffusionUNet, DiffusionModel
+    def create_diffusion_trainer(n_steps=100, learning_rate=1e-4, image_size=51,
+                                 base_filters=64, beta_start=1e-4, beta_end=0.02):
         trainer = MPITrainer()
-        denoiser = DiffusionUNet(
-            in_channels=2,
-            out_channels=1,
-            base_filters=base_filters,
-            image_size=image_size,
-            time_embed_dim=256
-        )
-        trainer.model = DiffusionModel(
-            denoiser=denoiser,
+        trainer.create_model(
+            'diffusion',
             n_steps=n_steps,
+            image_size=image_size,
+            base_filters=base_filters,
             beta_start=beta_start,
-            beta_end=beta_end
+            beta_end=beta_end,
         )
-        trainer.model_type = 'diffusion'
-        trainer.model.to(trainer.device)
-        trainer.setup_training(learning_rate=learning_rate)
-        return trainer
-
-    @staticmethod
-    def create_hybrid_trainer(system_matrix, image_shape, modl_iterations=5, diffusion_steps=100,
-                             learning_rate=1e-4, base_filters=64):
-        trainer = MPITrainer()
-        trainer.create_model('hybrid',
-                           system_matrix=system_matrix,
-                           image_shape=image_shape,
-                           modl_iterations=modl_iterations,
-                           diffusion_steps=diffusion_steps,
-                           base_filters=base_filters)
         trainer.setup_training(learning_rate=learning_rate)
         return trainer

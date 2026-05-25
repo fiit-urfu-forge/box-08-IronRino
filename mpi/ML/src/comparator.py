@@ -1,4 +1,6 @@
-"""Сравнение методов реконструкции MPI: Тихонов vs KatsMarc vs Chae vs DIP vs Shang vs PGNet vs DEQ-MPI vs CNN vs MoDL vs Diffusion vs Hybrid"""
+"""Сравнение методов реконструкции MPI:
+Tikhonov / Kaczmarz / Chae / DIP / Shang / DEQ-MPI / CNN / MoDL / Diffusion / PMCNet-trio.
+"""
 
 import numpy as np
 import time
@@ -7,9 +9,10 @@ import h5py
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 
-from .models import (TikhonovReconstructor, KatsMarcAlgorithm, ChaeSingleLayerNN,
-                     DeepImagePrior, ShangCNN, PGNet, DEQMPI)
-from .pmcnet import (
+from .models import (
+    TikhonovReconstructor, KatsMarcAlgorithm,
+    ChaeSingleLayerNN, ChaeMultiLayerNN,
+    DeepImagePrior, ShangCNN, DEQMPI,
     PMCNetReconstructor, PMCNetRefinedReconstructor,
     PMCNetStandard, PMCNetPhysicsEnhanced, PMCNetFinal,
 )
@@ -26,13 +29,11 @@ class MPIReconstructionComparator:
         self.cnn_trainer = None
         self.modl_trainer = None
         self.diffusion_trainer = None
-        self.hybrid_trainer = None
 
-        # Новые модели
+        # Модели по статьям
         self.chae_model = None
         self.dip_model = None
         self.shang_model = None
-        self.pgnet_model = None
         self.deq_model = None
         # PMCNet (Huang et al., 2026) — три варианта в одной системе координат
         self.pmcnet_reconstructor = None              # legacy alias for Standard
@@ -91,9 +92,6 @@ class MPIReconstructionComparator:
     def set_diffusion_model(self, diffusion_trainer):
         self.diffusion_trainer = diffusion_trainer
 
-    def set_hybrid_model(self, hybrid_trainer):
-        self.hybrid_trainer = hybrid_trainer
-
     def set_chae_model(self, chae_model):
         """Установка модели Chae (2017)"""
         self.chae_model = chae_model
@@ -105,10 +103,6 @@ class MPIReconstructionComparator:
     def set_shang_model(self, shang_model):
         """Установка модели Shang et al. (2020)"""
         self.shang_model = shang_model
-
-    def set_pgnet_model(self, pgnet_model):
-        """Установка модели PGNet (Wu et al., 2023)"""
-        self.pgnet_model = pgnet_model
 
     def set_deq_model(self, deq_model):
         """Установка модели DEQ-MPI (Güngör et al., 2024)"""
@@ -343,36 +337,7 @@ class MPIReconstructionComparator:
         return reconstructed
 
     # ====================================================================
-    # МЕТОД 4: Wu et al. (2023) - PGNet (Projection Generation Network)
-    # ====================================================================
-    def pgnet_reconstruction(self, measurement):
-        """Реконструкция методом PGNet (Wu et al., 2023)"""
-        if self.pgnet_model is None:
-            raise ValueError("PGNet модель не установлена")
-
-        real_part = measurement.real
-        imag_part = measurement.imag
-        meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32).unsqueeze(0)
-
-        self.pgnet_model.eval()
-        with torch.no_grad():
-            reconstructed = self.pgnet_model(meas_tensor)[0, 0].numpy()
-
-        if reconstructed.shape != self.image_shape:
-            from scipy import ndimage
-            reconstructed = ndimage.zoom(reconstructed,
-                                         (self.nx / reconstructed.shape[0],
-                                          self.ny / reconstructed.shape[1]),
-                                         order=1)
-
-        if reconstructed.max() > 0:
-            reconstructed = reconstructed / reconstructed.max()
-
-        return reconstructed
-
-    # ====================================================================
-    # МЕТОД 5: Güngör et al. (2024) - DEQ-MPI
+    # МЕТОД 4: Güngör et al. (2024) - DEQ-MPI
     # ====================================================================
     def deq_reconstruction(self, measurement):
         """Реконструкция методом DEQ-MPI (Güngör et al., 2024)"""
@@ -599,46 +564,13 @@ class MPIReconstructionComparator:
 
         return reconstructed
 
-    def hybrid_reconstruction(self, measurement):
-        """Реконструкция гибридной моделью (MoDL + Diffusion)"""
-        if self.hybrid_trainer is None:
-            raise ValueError("Hybrid модель не установлена")
-
-        import torch
-
-        real_part = measurement.real
-        imag_part = measurement.imag
-        meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32).unsqueeze(0).to(self.hybrid_trainer.device)
-
-        self.hybrid_trainer.model.eval()
-        with torch.no_grad():
-            reconstructed = self.hybrid_trainer.model(meas_tensor)
-
-        if isinstance(reconstructed, tuple):
-            reconstructed = reconstructed[0]
-
-        reconstructed = reconstructed[0, 0].cpu().numpy()
-
-        if reconstructed.max() > 0:
-            reconstructed = reconstructed / reconstructed.max()
-
-        if reconstructed.shape != self.image_shape:
-            from scipy import ndimage
-            reconstructed = ndimage.zoom(reconstructed,
-                                         (self.nx / reconstructed.shape[0],
-                                          self.ny / reconstructed.shape[1]),
-                                         order=1)
-
-        return reconstructed
-
     def load_openmpi_data(self, data_dir=None):
         """Загрузка OpenMPI датасета для проверки моделей.
 
         data_dir=None — путь определяется автоматически
         (локальная папка ChineseData/OpenMPIData, без скачивания).
         """
-        from .openmpi_loader import OpenMPIDataManager
+        from .data.openmpi import OpenMPIDataManager
 
         print("\n" + "=" * 70)
         print("ЗАГРУЗКА OPENMPI ДАТАСЕТА ДЛЯ ВАЛИДАЦИИ")
@@ -770,10 +702,8 @@ class MPIReconstructionComparator:
             ('DIP(2020)',
              lambda m: self.dip_reconstruction(m) if hasattr(self, 'dip_model') and self.dip_model else None,
              "Dittmer et al."),
-            ('Shang(2020)', self.shang_reconstruction if hasattr(self, 'shang_model') and self.shang_model else None,
-             "Shang et al."),
-            ('PGNet(2023)', self.pgnet_reconstruction if hasattr(self, 'pgnet_model') and self.pgnet_model else None,
-             "Wu et al."),
+            ('Shang(2022)', self.shang_reconstruction if hasattr(self, 'shang_model') and self.shang_model else None,
+             "Shang et al. - FDS-MPI"),
             ('DEQ-MPI(2024)', self.deq_reconstruction if hasattr(self, 'deq_model') and self.deq_model else None,
              "Güngör et al."),
             ('PMCNet-Std(2026)',
@@ -886,8 +816,7 @@ class MPIReconstructionComparator:
             ('Chae(2017)', self.chae_reconstruction if self.chae_model else None, "Chae - Single Layer NN"),
             ('DIP(2020)', lambda m: self.dip_reconstruction(m, n_iterations=300) if self.dip_model else None,
              "Dittmer et al. - Deep Image Prior"),
-            ('Shang(2020)', self.shang_reconstruction if self.shang_model else None, "Shang et al. - CNN SR"),
-            ('PGNet(2023)', self.pgnet_reconstruction if self.pgnet_model else None, "Wu et al. - PGNet"),
+            ('Shang(2022)', self.shang_reconstruction if self.shang_model else None, "Shang et al. - FDS-MPI dual-branch"),
             ('DEQ-MPI(2024)', self.deq_reconstruction if self.deq_model else None, "Güngör et al. - DEQ-MPI"),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
@@ -965,20 +894,18 @@ class MPIReconstructionComparator:
         print("ПОЛНОЕ СРАВНЕНИЕ МЕТОДОВ РЕКОНСТРУКЦИИ MPI")
         print("=" * 90)
         print("\nСравниваемые методы и их источники:")
-        print("  1. Тихонов     - Tikhonov regularization (1963)")
-        print("  2. KatsMarc    - Kaczmarz algorithm (1937) - ART")
-        print("  3. Chae(2017)  - Single-layer fully connected network (ETRI Journal)")
-        print("  4. DIP(2020)   - Deep Image Prior (Dittmer et al., arXiv)")
-        print("  5. Shang(2020) - CNN for resolution improvement (Physics in Medicine & Biology)")
-        print("  6. PGNet(2023) - Projection Generation Network (Wu et al., Medical Physics)")
-        print("  7. DEQ-MPI(2024) - Deep Equilibrium Model (Güngör et al., IEEE TMI)")
-        print("  8. PMCNet-Std(2026)   - PMCNet Standard, измеренная SM (Huang et al., IEEE TMag)")
-        print("  9. PMCNet-Phys(2026)  - PMCNet с улучшенной физикой (аналитическая SM)")
-        print(" 10. PMCNet-Final(2026) - PMCNet физика + NN-оптимизации (Debye/multi-color/TV)")
-        print(" 11. CNN          - Standard UNet")
-        print(" 12. MoDL         - Model-based Deep Learning")
-        print(" 13. Diffusion    - Diffusion model")
-        print(" 14. Hybrid       - MoDL + Diffusion")
+        print("  1. Тихонов              - Tikhonov regularization (1963)")
+        print("  2. KatsMarc             - Kaczmarz algorithm (1937) - ART")
+        print("  3. Chae(2017)           - Single-layer FC NN (ETRI Journal)")
+        print("  4. DIP(2020)            - Deep Image Prior (Dittmer et al.)")
+        print("  5. Shang(2022)          - FDS-MPI dual-branch CNN (PMB)")
+        print("  6. DEQ-MPI(2024)        - Deep Equilibrium Model (Güngör et al., IEEE TMI)")
+        print("  7. PMCNet-Std(2026)     - PMCNet Standard, измеренная SM (Huang et al.)")
+        print("  8. PMCNet-Phys(2026)    - PMCNet + улучшенная физика (аналитическая SM)")
+        print("  9. PMCNet-Final(2026)   - PMCNet + физика + NN-оптимизации")
+        print(" 10. CNN                  - U-Net baseline")
+        print(" 11. MoDL                 - Model-based Deep Learning")
+        print(" 12. Diffusion            - DDPM baseline")
         print("=" * 90)
 
         all_results = []
@@ -1052,20 +979,18 @@ class MPIReconstructionComparator:
 
             f.write("СПИСОК МЕТОДОВ И ИСТОЧНИКОВ:\n")
             f.write("-" * 60 + "\n")
-            f.write("1. Тихонов     - Tikhonov regularization (1963)\n")
-            f.write("2. KatsMarc    - Kaczmarz algorithm (1937) - ART\n")
-            f.write("3. Chae(2017)  - Single-layer fully connected network (ETRI Journal)\n")
-            f.write("4. DIP(2020)   - Deep Image Prior (Dittmer et al., arXiv)\n")
-            f.write("5. Shang(2020) - CNN for resolution improvement (Physics in Medicine & Biology)\n")
-            f.write("6. PGNet(2023) - Projection Generation Network (Wu et al., Medical Physics)\n")
-            f.write("7. DEQ-MPI(2024)      - Deep Equilibrium Model (Güngör et al., IEEE TMI)\n")
-            f.write("8. PMCNet-Std(2026)   - PMCNet Standard, измеренная SM (Huang et al., IEEE TMag)\n")
-            f.write("9. PMCNet-Phys(2026)  - PMCNet с улучшенной физикой (аналитическая SM)\n")
-            f.write("10. PMCNet-Final(2026) - PMCNet физика + NN-оптимизации (Debye/multi-color/TV)\n")
-            f.write("11. CNN       - Standard UNet\n")
-            f.write("12. MoDL      - Model-based Deep Learning\n")
-            f.write("13. Diffusion - Diffusion model\n")
-            f.write("14. Hybrid    - MoDL + Diffusion\n")
+            f.write("1. Тихонов              - Tikhonov regularization (1963)\n")
+            f.write("2. KatsMarc             - Kaczmarz algorithm (1937) - ART\n")
+            f.write("3. Chae(2017)           - Single-layer FC NN (ETRI Journal)\n")
+            f.write("4. DIP(2020)            - Deep Image Prior (Dittmer et al.)\n")
+            f.write("5. Shang(2022)          - FDS-MPI dual-branch CNN (PMB)\n")
+            f.write("6. DEQ-MPI(2024)        - Deep Equilibrium Model (Güngör et al., IEEE TMI)\n")
+            f.write("7. PMCNet-Std(2026)     - PMCNet Standard, измеренная SM (Huang et al.)\n")
+            f.write("8. PMCNet-Phys(2026)    - PMCNet + улучшенная физика (аналитическая SM)\n")
+            f.write("9. PMCNet-Final(2026)   - PMCNet + физика + NN-оптимизации\n")
+            f.write("10. CNN                  - U-Net baseline\n")
+            f.write("11. MoDL                 - Model-based Deep Learning\n")
+            f.write("12. Diffusion            - DDPM baseline\n")
             f.write("\n" + "=" * 120 + "\n\n")
 
             for result in self.results:

@@ -65,23 +65,46 @@ class PMCNetConfig:
     use_debye: bool = False
     # Начальное значение постоянной времени релаксации, секунды
     init_tau_seconds: float = 2.0e-6
-    # Драйв-частоты (используются для построения частотной сетки гармоник,
-    # если она не передана явно) — параметры из эксперимента в статье
-    drive_frequency_x: float = 24.5e3
-    drive_frequency_y: float = 25.25e3
 
-    # ---- параметры аналитического прямого оператора
-    # (PMCNetWithAnalyticalPhysics, LaTeX-документ Таб. 1) ----
-    image_extent_m: float = 0.02         # L_x = L_y, метры
-    gradient_strength: float = 50e3      # G_x = G_y, A/м/м
-    coil_radius_m: float = 5.0e-3        # R_coil для s(r) = 1/(1+(r/R)²)
-    saturation_magnetization_T: float = 0.6  # m_sat (через μ₀)
-    particle_diameter_nm: float = 30.0   # диаметр МНЧ
+    # ---- параметры аналитического прямого оператора ----
+    # Все дефолты соответствуют BeihangUniversityData (2D Narrowband MPI
+    # System, Beihang University, 2023-09-07) — см. «Описание параметров
+    # файла H5.docx». Где у реальной системы анизотропия (G_x ≠ G_y,
+    # A_x ≠ A_y), в config приведены значения по оси X; для оси Y указаны
+    # отдельные поля `*_y` ниже. Для симметричной симуляции (как в статье
+    # PMCNet) задайте равные _x/_y значения вручную.
+
+    # Драйв-частоты (H5: acquisition.drivefield.driveFrequency)
+    drive_frequency_x: float = 24510.0   # Гц
+    drive_frequency_y: float = 26042.0   # Гц
+
+    # Селективный градиент поля (H5: acquisition.gradient)
+    # 0.56 T/m в A/m/m = 0.56 / μ₀ ≈ 4.456·10⁵
+    gradient_strength: float = 4.456e5     # G_x в А/м/м (= 0.56 Т/м)
+    gradient_strength_y: float = 8.913e5   # G_y в А/м/м (= 1.12 Т/м)
+
+    # Амплитуда драйв-поля (H5: acquisition.drivefield.strength)
+    # 4 мТ в A/m = 4·10⁻³ / μ₀ ≈ 3183
+    drive_field_amplitude: float = 3183.0     # A_x в А/м (= 4 мТ)
+    drive_field_amplitude_y: float = 8913.0   # A_y в А/м (= 11.2 мТ)
+
+    # FOV сканирования (H5: calibration.fieldOfView)
+    image_extent_m: float = 0.038        # L_x = L_y, метры (38 мм)
+
+    # Чувствительность приёмной катушки (R_coil для s(r) = 1/(1+(r/R)²)).
+    # Прямо в H5 нет; типично ≈ радиус FOV.
+    coil_radius_m: float = 0.020
+
+    # Свойства частиц (H5: tracer.name = Perimag; Fe₃O₄ ≈ 0.6 Т насыщения,
+    # магнитный диаметр ~20 нм)
+    saturation_magnetization_T: float = 0.6
+    particle_diameter_nm: float = 20.0
     temperature_K: float = 300.0
-    n_time_samples: int = 1024           # число точек по t в траектории FFP
-    # Если None, длительность сканирования = одному биению Лиссажу
-    # 1/|f_x − f_y|, что обеспечивает полное покрытие области (см. LaTeX
-    # Eq. 8 и комментарий пользователя: f_x ≠ f_y).
+
+    # Число точек по t в траектории FFP. По умолчанию одно «биение»
+    # Лиссажу = 1/|f_x − f_y| ≈ 6.527·10⁻⁴ с, что совпадает с H5
+    # `acquisition.drivefield.cycle = 6.528·10⁻⁴ с`.
+    n_time_samples: int = 1024
     scan_duration_s: Optional[float] = None
 
     # Регуляризаторы
@@ -323,36 +346,49 @@ class RadialCoilSensitivity(nn.Module):
 
 
 class LissajousFFPTrajectory(nn.Module):
-    """Траектория FFP в виде фигуры Лиссажу (LaTeX Eq. 8):
+    """Траектория FFP в виде фигуры Лиссажу.
 
-        r_FFP_x(t) = (L_x / 2) · sin(2π · f_x · t)
-        r_FFP_y(t) = (L_y / 2) · sin(2π · f_y · t)
+    Точка FFP — это место, где полное поле H_total = 0, т.е.
+        G_x·r_FFP_x + A_x·sin(2π·f_x·t) = 0
+        ⇒ r_FFP_x(t) = − (A_x / G_x) · sin(2π·f_x·t)
+    и аналогично по y. Амплитуда хода FFP равна `A / G`, а НЕ полу-FOV:
+    для BeihangUniversityData с A_x = 4 мТ, G_x = 0.56 Т/м FFP по x
+    раскачивается на ±7.14 мм, хотя FOV = ±19 мм (38% покрытия).
 
-    Условие f_x ≠ f_y (и в идеале f_y/f_x иррационально) гарантирует
-    апериодичность траектории и полное покрытие области FOV — этот
-    эффект как раз отличает Лиссажу от растрового сканирования.
+    Условие f_x ≠ f_y (в идеале — иррациональное отношение) даёт
+    апериодичность траектории и плотное покрытие активной области FFP.
 
-    Эквивалентно: точка FFP — это место, где H_total = 0, т.е.
-    G·r_FFP(t) = −H_exc(t) → r_FFP(t) = −H_exc(t)/G. Здесь используется
-    готовая параметрическая запись.
+    Args:
+        amp_x_m, amp_y_m: амплитуда FFP по каждой оси (метры). Если задан
+            только `image_extent_m` (legacy-вариант), берётся `extent/2`.
     """
 
-    def __init__(self, image_extent_m: float, n_time_samples: int,
+    def __init__(self, n_time_samples: int,
                  freq_x_hz: float, freq_y_hz: float,
+                 amp_x_m: Optional[float] = None,
+                 amp_y_m: Optional[float] = None,
+                 image_extent_m: Optional[float] = None,
                  duration_s: Optional[float] = None):
         super().__init__()
+        if amp_x_m is None or amp_y_m is None:
+            if image_extent_m is None:
+                raise ValueError(
+                    "Передайте либо (amp_x_m, amp_y_m), либо image_extent_m"
+                )
+            amp_x_m = amp_x_m if amp_x_m is not None else image_extent_m / 2.0
+            amp_y_m = amp_y_m if amp_y_m is not None else image_extent_m / 2.0
         if duration_s is None:
-            # Длительность одного биения f_x − f_y → полное покрытие
             duration_s = 1.0 / max(abs(freq_x_hz - freq_y_hz), 1.0)
         t = torch.linspace(0.0, duration_s, n_time_samples)
-        amp = image_extent_m / 2.0
-        r_x = amp * torch.sin(2.0 * math.pi * freq_x_hz * t)
-        r_y = amp * torch.sin(2.0 * math.pi * freq_y_hz * t)
+        r_x = amp_x_m * torch.sin(2.0 * math.pi * freq_x_hz * t)
+        r_y = amp_y_m * torch.sin(2.0 * math.pi * freq_y_hz * t)
         self.register_buffer('t', t)
-        self.register_buffer('r_x', r_x)  # (T,)
+        self.register_buffer('r_x', r_x)
         self.register_buffer('r_y', r_y)
         self.duration_s = float(duration_s)
         self.n_time_samples = int(n_time_samples)
+        self.amp_x_m = float(amp_x_m)
+        self.amp_y_m = float(amp_y_m)
 
     @property
     def dt(self) -> torch.Tensor:
@@ -451,11 +487,18 @@ class AnalyticalForwardModel(nn.Module):
             image_extent_m=config.image_extent_m,
             coil_radius_m=config.coil_radius_m,
         )
+        # FFP-амплитуды строго из физики: A / G. Для BeihangUniversityData
+        # A_x = 4 мТ, G_x = 0.56 Т/м → амплитуда ≈ 7.14 мм при FOV ±19 мм
+        # (FFP покрывает не весь FOV — нужно учесть это в траектории).
+        amp_x_m = config.drive_field_amplitude / config.gradient_strength
+        amp_y_m = (config.drive_field_amplitude_y /
+                   config.gradient_strength_y)
         self.ffp = LissajousFFPTrajectory(
-            image_extent_m=config.image_extent_m,
             n_time_samples=config.n_time_samples,
             freq_x_hz=config.drive_frequency_x,
             freq_y_hz=config.drive_frequency_y,
+            amp_x_m=amp_x_m,
+            amp_y_m=amp_y_m,
             duration_s=config.scan_duration_s,
         )
         self.langevin = LangevinMagnetization(
@@ -464,8 +507,12 @@ class AnalyticalForwardModel(nn.Module):
             temperature_K=config.temperature_K,
         )
         self.ddt = TimeDerivativeFD(dt=float(self.ffp.dt.item()))
-        self.register_buffer('gradient',
-                             torch.tensor(config.gradient_strength, dtype=torch.float32))
+        self.register_buffer('gradient_x',
+                             torch.tensor(config.gradient_strength,
+                                          dtype=torch.float32))
+        self.register_buffer('gradient_y',
+                             torch.tensor(config.gradient_strength_y,
+                                          dtype=torch.float32))
 
         # Пиксельные веса для квадратурной интеграции
         Nx, Ny = config.image_size
@@ -474,15 +521,18 @@ class AnalyticalForwardModel(nn.Module):
         self.register_buffer('dA', torch.tensor(dx * dy, dtype=torch.float32))
 
     def _compute_magnetization(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """M_x(x,y,t), M_y(x,y,t) — каждое (Nx, Ny, T)."""
-        # H(r, t) = G · (r − r_FFP(t))   (Eq. 5 + Eq. 6 LaTeX)
-        # X, Y: (Nx, Ny);  r_x, r_y: (T,) → бродкаст в (Nx, Ny, T).
+        """M_x(x,y,t), M_y(x,y,t) — каждое (Nx, Ny, T).
+
+        Анизотропный градиент: H_x = G_x·(x − r_FFP_x), H_y = G_y·(y − r_FFP_y).
+        Это соответствует записи реального сканера BeihangUniversityData,
+        где G_x ≠ G_y (0.56 vs 1.12 Т/м).
+        """
         X = self.coil.X.unsqueeze(-1)             # (Nx, Ny, 1)
         Y = self.coil.Y.unsqueeze(-1)
         r_x = self.ffp.r_x.view(1, 1, -1)         # (1, 1, T)
         r_y = self.ffp.r_y.view(1, 1, -1)
-        Hx = self.gradient * (X - r_x)
-        Hy = self.gradient * (Y - r_y)
+        Hx = self.gradient_x * (X - r_x)
+        Hy = self.gradient_y * (Y - r_y)
         return self.langevin(Hx, Hy)
 
     def forward(self, concentration: torch.Tensor) -> torch.Tensor:
