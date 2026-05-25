@@ -41,6 +41,9 @@ class MPIReconstructionComparator:
         self.pmcnet_standard = None                    # 1) измеренная SM
         self.pmcnet_physics_enhanced = None            # 2) аналитическая SM
         self.pmcnet_final = None                       # 3) аналитическая SM + Debye + multi-color + TV
+
+        # Mixture of Experts поверх остальных методов
+        self.moe = None
         self.katsmarc = self.katsmarc if hasattr(self, 'katsmarc') else None
 
         self.results = []
@@ -146,6 +149,21 @@ class MPIReconstructionComparator:
         TV-регуляризация, hard constraints by construction.
         """
         self.pmcnet_final = reconstructor
+
+    def set_moe(self, moe):
+        """Установить Mixture of Experts поверх остальных методов.
+
+        MoE сам внутри прогоняет всех своих экспертов и комбинирует их
+        выходы (через mean / scalar / spatial gating).
+        """
+        self.moe = moe
+
+    def moe_reconstruction(self, measurement):
+        """Реконструкция через MoE: эксперты + комбинирование."""
+        if self.moe is None:
+            raise ValueError("MoE модель не установлена")
+        recon = self.moe.reconstruct(measurement)
+        return self._postprocess_recon(recon)
 
     def generate_test_case(self, radius=0.2, distance=0.2, intensity1=0.7, intensity2=0.7):
         """Генерация тестового случая с двумя каплями"""
@@ -717,6 +735,8 @@ class MPIReconstructionComparator:
              "Huang et al. - +физика+NN-оптимизации"),
             ('CNN', self.cnn_reconstruction if hasattr(self, 'cnn_trainer') and self.cnn_trainer else None, "CNN"),
             ('MoDL', self.modl_reconstruction if hasattr(self, 'modl_trainer') and self.modl_trainer else None, "MoDL"),
+            ('MoE', self.moe_reconstruction if self.moe else None,
+             "Mixture of Experts (per-pixel gating)"),
         ]
 
         openmpi_results = {}
@@ -830,6 +850,8 @@ class MPIReconstructionComparator:
             ('CNN', self.cnn_reconstruction if self.cnn_trainer else None, "CNN (UNet)"),
             ('MoDL', self.modl_reconstruction if self.modl_trainer else None, "MoDL Network"),
             ('Diffusion', self.diffusion_reconstruction if self.diffusion_trainer else None, "Diffusion Model"),
+            ('MoE', self.moe_reconstruction if self.moe else None,
+             "Mixture of Experts (комбинирование моделей)"),
         ]
 
         print(f"\n{'Метод':<15} {'Источник':<35} {'SSIM':<8} {'PSNR (дБ)':<12} {'FWHM':<8} {'Время (с)':<10}")
@@ -906,6 +928,7 @@ class MPIReconstructionComparator:
         print(" 10. CNN                  - U-Net baseline")
         print(" 11. MoDL                 - Model-based Deep Learning")
         print(" 12. Diffusion            - DDPM baseline")
+        print(" 13. MoE                  - Mixture of Experts (комбинирование моделей)")
         print("=" * 90)
 
         all_results = []
@@ -991,6 +1014,7 @@ class MPIReconstructionComparator:
             f.write("10. CNN                  - U-Net baseline\n")
             f.write("11. MoDL                 - Model-based Deep Learning\n")
             f.write("12. Diffusion            - DDPM baseline\n")
+            f.write("13. MoE                  - Mixture of Experts (комбинирование моделей)\n")
             f.write("\n" + "=" * 120 + "\n\n")
 
             for result in self.results:

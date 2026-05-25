@@ -17,6 +17,7 @@ from .dip import DeepImagePrior
 from .shang import ShangCNN, FDSMPI
 from .deq import DEQMPI, RDNBlock, LCBlock
 from .simple import MPIReconstructionCNN, MoDLNetwork, DiffusionModel
+from .moe import MoEReconstructor
 from .pmcnet import (
     PMCNetConfig,
     PMCNet,
@@ -50,6 +51,8 @@ __all__ = [
     'DEQMPI', 'RDNBlock', 'LCBlock',
     # Baselines
     'MPIReconstructionCNN', 'MoDLNetwork', 'DiffusionModel',
+    # Mixture of Experts
+    'MoEReconstructor',
     # PMCNet (trio + helpers)
     'PMCNetConfig',
     'PMCNet', 'PMCNetWithRefinedPhysics', 'PMCNetWithAnalyticalPhysics',

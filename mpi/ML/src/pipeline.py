@@ -40,6 +40,7 @@ from .models import (
     ChaeSingleLayerNN, ChaeMultiLayerNN,
     DeepImagePrior, ShangCNN, DEQMPI,
     PMCNetConfig, PMCNetStandard, PMCNetPhysicsEnhanced, PMCNetFinal,
+    MoEReconstructor,
 )
 from .trainer import MPITrainer, ModelTrainerFactory
 from .comparator import MPIReconstructionComparator
@@ -397,6 +398,118 @@ def build_pmcnet_trio(SM, image_shape,
 
 
 # ---------------------------------------------------------------------------
+# 2.5. Mixture of Experts — комбинирование моделей
+# ---------------------------------------------------------------------------
+
+
+def build_moe(comparator, image_shape,
+              X_train, y_train,
+              expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)',
+                            'Shang(2022)', 'CNN'),
+              n_train_samples: int = 64,
+              epochs: int = 30,
+              mode: str = 'spatial'):
+    """Собрать MoE поверх уже привязанных к comparator'у экспертов.
+
+    Шаги:
+      1. Из comparator достаём callable'ы выбранных экспертов
+         (имена должны совпадать с теми, что появляются в таблице
+         сравнения).
+      2. Прогоняем экспертов на маленькой выборке из training set,
+         сохраняя их предсказания — это вход для обучения gating.
+      3. Тренируем gating (per-pixel CNN по умолчанию) минимизировать
+         MSE против ground truth.
+      4. Возвращаем готовый `MoEReconstructor`, чтобы подключить
+         его в comparator.
+
+    PMCNet намеренно НЕ включён в дефолтный список экспертов: его
+    реконструкция требует ~1500 итераций оптимизации на одно
+    измерение, и прекомпьют по нескольким десяткам образцов получится
+    слишком долгим. Добавляйте `'PMCNet-Std(2026)'` и др. вручную,
+    если есть бюджет времени.
+    """
+    print("\n" + "=" * 70)
+    print(f"2.5. MIXTURE OF EXPERTS — комбинирование ({len(expert_names)} экспертов)")
+    print("=" * 70)
+    print(f"  Эксперты: {list(expert_names)}")
+    print(f"  Режим комбинирования: {mode!r}")
+
+    # Достаём callable'ы из текущего comparator
+    name_to_callable = {
+        'Тихонов': comparator.tikhonov_reconstruction,
+        'KatsMarc': lambda m: comparator.katsmarc_reconstruction(m, n_iterations=10),
+        'Chae(2017)': comparator.chae_reconstruction,
+        'DIP(2020)': comparator.dip_reconstruction,
+        'Shang(2022)': comparator.shang_reconstruction,
+        'DEQ-MPI(2024)': comparator.deq_reconstruction,
+        'CNN': comparator.cnn_reconstruction,
+        'MoDL': comparator.modl_reconstruction,
+        'Diffusion': comparator.diffusion_reconstruction,
+        'PMCNet-Std(2026)': comparator.pmcnet_standard_reconstruction,
+        'PMCNet-Phys(2026)': comparator.pmcnet_physics_enhanced_reconstruction,
+        'PMCNet-Final(2026)': comparator.pmcnet_final_reconstruction,
+    }
+    experts = {}
+    for n in expert_names:
+        if n not in name_to_callable:
+            print(f"  Skipped (unknown expert): {n}")
+            continue
+        # Проверяем что соответствующая модель установлена
+        try:
+            test_recon = name_to_callable[n]  # пробная сборка callable
+            experts[n] = test_recon
+        except Exception as e:
+            print(f"  Skipped ({n}): {e}")
+
+    if not experts:
+        print("  Ни один эксперт недоступен — MoE пропущен.")
+        return None
+
+    moe = MoEReconstructor(
+        experts=experts,
+        image_shape=image_shape,
+        mode=mode,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+    )
+
+    # Прекомпьют выходов экспертов на n_train_samples образцов
+    n_use = min(n_train_samples, len(X_train))
+    idx = np.random.choice(len(X_train), n_use, replace=False)
+    measurements_subset = [X_train[i] for i in idx]
+    targets_subset = torch.tensor(y_train[idx], dtype=torch.float32)
+    print(f"\n  Прекомпьют выходов экспертов на {n_use} образцах...")
+    expert_recons = moe.precompute_expert_recons(
+        measurements_subset, show_progress=True)
+
+    # Обучение gating
+    if mode != 'mean':
+        print(f"\n  Обучение gating ({mode}, {epochs} эпох)...")
+        moe.train_gating(expert_recons, targets_subset,
+                         epochs=epochs, lr=1e-3, batch_size=8,
+                         verbose=True)
+
+    # Diagnostic: разница MSE между лучшим индивидуальным экспертом
+    # и MoE-комбинированием на этой же выборке
+    with torch.no_grad():
+        moe.eval()
+        moe_pred = moe(expert_recons.to(moe.device))
+        moe_mse = ((moe_pred.cpu() - targets_subset.unsqueeze(1)) ** 2).mean().item()
+        expert_mses = ((expert_recons - targets_subset.unsqueeze(1)) ** 2
+                       ).mean(dim=(0, 2, 3))
+        best_expert_idx = int(expert_mses.argmin())
+        best_name = moe.expert_names[best_expert_idx]
+        print(f"\n  MSE на training-выборке:")
+        for i, name in enumerate(moe.expert_names):
+            mark = ' ← лучший' if i == best_expert_idx else ''
+            print(f"    {name:<18} MSE={expert_mses[i].item():.4e}{mark}")
+        improvement = (expert_mses.min().item() - moe_mse) / expert_mses.min().item() * 100
+        print(f"    {'MoE':<18} MSE={moe_mse:.4e}  "
+              f"(улучшение vs {best_name}: {improvement:+.1f}%)")
+
+    return moe
+
+
+# ---------------------------------------------------------------------------
 # 3+4. Финальное сравнение
 # ---------------------------------------------------------------------------
 
@@ -484,6 +597,19 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     cmp.set_pmcnet_standard(pmcnet_std)
     cmp.set_pmcnet_physics_enhanced(pmcnet_phys)
     cmp.set_pmcnet_final(pmcnet_final)
+
+    # 2.5) MoE поверх быстрых экспертов
+    moe = build_moe(
+        comparator=cmp,
+        image_shape=image_shape,
+        X_train=X_train, y_train=y_train,
+        expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'Shang(2022)', 'CNN'),
+        n_train_samples=64,
+        epochs=30,
+        mode='spatial',
+    )
+    if moe is not None:
+        cmp.set_moe(moe)
 
     synthetic_results = run_full_comparison(cmp, distances=distances)
 
