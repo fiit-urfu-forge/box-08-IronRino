@@ -197,7 +197,11 @@ class MPIReconstructionComparator:
         return measurement_reshaped
 
     def tikhonov_reconstruction(self, measurement, mu=0.001, kmax=100):
-        return self.tikhonov_reconstructor.reconstruct(measurement, mu, kmax)
+        recon = self.tikhonov_reconstructor.reconstruct(measurement, mu, kmax)
+        recon = np.asarray(recon).reshape(self.image_shape)
+        if recon.max() > 0:
+            recon = recon / recon.max()
+        return recon
 
     # ====================================================================
     # МЕТОД 1: Chae (2017) - Однослойная полносвязная нейронная сеть

@@ -14,10 +14,10 @@ from src.pipeline import run_pipeline  # noqa: E402
 
 
 if __name__ == '__main__':
-    # Параметры запуска
-    NUM_SAMPLES = 2000      # размер синтетического обучающего датасета
+    # Параметры запуска (минимальные — для отладки)
+    NUM_SAMPLES = 200       # размер синтетического обучающего датасета
     TRAIN_MODELS = True     # False — загружать сохранённые веса
-    PMCNET_ITER = 1500      # итераций оптимизации на одно измерение
+    PMCNET_ITER = 50        # итераций оптимизации на одно измерение
 
     results = run_pipeline(
         num_samples=NUM_SAMPLES,

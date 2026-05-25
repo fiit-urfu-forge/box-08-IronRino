@@ -142,10 +142,73 @@ def _flatten_measurement_batch(X):
     return out.astype(np.float32)
 
 
+def _synthesize_measurements_through_SM(y_images, SM,
+                                        snr_db: float = 30.0,
+                                        random_seed: int = 0):
+    """Регенерация измерений через ИЗМЕРЕННУЮ системную матрицу.
+
+    Синтетический генератор по умолчанию использует Chebyshev-SM с
+    `n_harmonics=200`, что даёт X-шейпы, несовместимые с измеренной SM
+    (которая обычно 2·n_freq_per_coil × N). Чтобы все обучаемые модели
+    (CNN/MoDL/Chae/Shang/DEQ) видели данные правильной размерности,
+    регенерируем `X = S · y` для каждого изображения y.
+
+    Args:
+        y_images: (N, H, W) ground-truth изображения.
+        SM:       (M, H·W) комплексная измеренная системная матрица.
+        snr_db:   шум, добавляемый поверх; None = без шума.
+
+    Returns:
+        (N, 2, M/2) complex64 — стандартный двух-катушечный формат.
+    """
+    rng = np.random.default_rng(random_seed)
+    N = len(y_images)
+    M_total = SM.shape[0]
+    M_per_coil = M_total // 2
+    out = np.zeros((N, 2, M_per_coil), dtype=np.complex64)
+    for i in range(N):
+        u = SM @ y_images[i].flatten()         # (M_total,) complex
+        out[i, 0] = u[:M_per_coil]
+        out[i, 1] = u[M_per_coil:]
+        if snr_db is not None and np.isfinite(snr_db):
+            sigma = np.std(np.abs(out[i])) / (10 ** (snr_db / 20))
+            if sigma > 0:
+                out[i] += sigma * (rng.standard_normal(out[i].shape)
+                                   + 1j * rng.standard_normal(out[i].shape))
+    return out
+
+
+def _format_for_cnn(X_complex):
+    """(N, 2, M_per_coil) complex → (N, 4, S, S) real (S² ≥ M_per_coil)."""
+    N, _, M_per_coil = X_complex.shape
+    S = int(np.ceil(np.sqrt(M_per_coil)))
+    target = S * S
+    out = np.zeros((N, 4, target), dtype=np.float32)
+    out[:, 0, :M_per_coil] = X_complex[:, 0].real
+    out[:, 1, :M_per_coil] = X_complex[:, 0].imag
+    out[:, 2, :M_per_coil] = X_complex[:, 1].real
+    out[:, 3, :M_per_coil] = X_complex[:, 1].imag
+    return out.reshape(N, 4, S, S)
+
+
+def _format_for_modl_deq(X_complex):
+    """(N, 2, M_per_coil) complex → (N, 4·M_per_coil) real.
+
+    Для MoDL/DEQ — вход — расширенное (Re, Im) представление измерения
+    в форме одного вектора длины 2·M_total = 4·M_per_coil. Порядок:
+    [coil0.real, coil1.real, coil0.imag, coil1.imag].
+    """
+    real_part = X_complex.real     # (N, 2, M_per_coil)
+    imag_part = X_complex.imag
+    re_flat = real_part.reshape(len(X_complex), -1)   # (N, 2·M_per_coil)
+    im_flat = imag_part.reshape(len(X_complex), -1)
+    return np.concatenate([re_flat, im_flat], axis=-1).astype(np.float32)
+
+
 # --- CNN baseline -----------------------------------------------------------
 
 def train_or_load_cnn(X_train, y_train, train: bool = True,
-                      epochs: int = 20):
+                      epochs: int = 5, output_size=(51, 51)):
     print("\n  CNN baseline (UNet)...")
     path = './DATA/models/cnn_best.pth'
     trainer = ModelTrainerFactory.create_cnn_trainer(
@@ -157,8 +220,9 @@ def train_or_load_cnn(X_train, y_train, train: bool = True,
         print("    загружена")
         return trainer
 
+    X_img = _format_for_cnn(X_train)                  # (N, 4, S, S)
     train_ds = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(X_img),
         torch.tensor(y_train[:, None], dtype=torch.float32),
     )
     loader = DataLoader(train_ds, batch_size=8, shuffle=True)
@@ -170,7 +234,7 @@ def train_or_load_cnn(X_train, y_train, train: bool = True,
 # --- MoDL baseline ----------------------------------------------------------
 
 def train_or_load_modl(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 15):
+                       train: bool = True, epochs: int = 5):
     print("\n  MoDL baseline...")
     path = './DATA/models/modl_best.pth'
     trainer = ModelTrainerFactory.create_modl_trainer(
@@ -183,14 +247,9 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
         print("    загружена")
         return trainer
 
-    # MoDL ждёт расширенные вещественные измерения (2M)
-    SM_M = SM.shape[0]
-    X_real = np.zeros((len(X_train), 2 * SM_M), dtype=np.float32)
-    for i, m in enumerate(X_train):
-        v = np.concatenate([m[0], m[1]])
-        X_real[i] = np.concatenate([v.real, v.imag])
+    X_real = _format_for_modl_deq(X_train)            # (N, 2·M_total)
     ds = TensorDataset(
-        torch.tensor(X_real, dtype=torch.float32),
+        torch.tensor(X_real),
         torch.tensor(y_train[:, None], dtype=torch.float32),
     )
     loader = DataLoader(ds, batch_size=8, shuffle=True)
@@ -202,7 +261,7 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
 
 # --- Diffusion baseline -----------------------------------------------------
 
-def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 10):
+def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 3):
     print("\n  Diffusion baseline (DDPM)...")
     path = './DATA/models/diffusion_best.pth'
     trainer = ModelTrainerFactory.create_diffusion_trainer(
@@ -229,7 +288,7 @@ def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 10):
 # --- Chae 2017 (single + multi layer) ---------------------------------------
 
 def train_or_load_chae(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 30):
+                       train: bool = True, epochs: int = 10):
     """Возвращает (single_layer_model, multi_layer_model) согласно статье."""
     print("\n  Chae (2017) — single + multi-layer FC...")
     in_dim = _model_input_dim(X_train)
@@ -283,7 +342,7 @@ def build_dip(image_shape):
 # --- Shang 2022 FDS-MPI -----------------------------------------------------
 
 def train_or_load_shang(X_train, y_train, SM, train: bool = True,
-                        epochs: int = 20):
+                        epochs: int = 5):
     print("\n  Shang (2022) FDS-MPI dual-branch...")
     path = './DATA/models/shang_best.pth'
     model = ShangCNN(input_channels=1, output_channels=1, base_filters=32)
@@ -326,7 +385,7 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
 # --- DEQ-MPI ----------------------------------------------------------------
 
 def train_or_load_deq(SM, image_shape, X_train, y_train,
-                      train: bool = True, epochs: int = 20):
+                      train: bool = True, epochs: int = 5):
     print("\n  DEQ-MPI (Güngör 2024) — RDN + LC...")
     path = './DATA/models/deq_best.pth'
     model = DEQMPI(system_matrix=SM, image_shape=image_shape,
@@ -337,12 +396,7 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
         print("    загружена")
         return model
 
-    # DEQ ждёт (B, M) расширенные вещественные измерения (Re; Im)
-    SM_M = SM.shape[0]
-    X_real = np.zeros((len(X_train), 2 * SM_M), dtype=np.float32)
-    for i, m in enumerate(X_train):
-        v = np.concatenate([m[0], m[1]])
-        X_real[i] = np.concatenate([v.real, v.imag])
+    X_real = _format_for_modl_deq(X_train)
     y_img = y_train[:, None].astype(np.float32)
     ds = TensorDataset(torch.tensor(X_real), torch.tensor(y_img))
     loader = DataLoader(ds, batch_size=8, shuffle=True)
@@ -564,8 +618,27 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     image_shape = gen.image_shape
     print(f"\nИзмеренная SM: {SM.shape}, image_shape={image_shape}")
 
-    X_train = dataset_sm['X_train']
-    y_train = dataset_sm['y_train']
+    # Синтетический генератор фантомов работает в (51, 51), а измеренная
+    # SM рассчитана на (image_shape) — обычно (19, 19). Перенесём фантомы
+    # на сетку SM, чтобы у CNN/MoDL/DEQ совпадали размеры.
+    y_synth = dataset_sm['y_train']
+    if y_synth.shape[1:] != tuple(image_shape):
+        from scipy.ndimage import zoom
+        zoom_factors = (1.0,
+                        image_shape[0] / y_synth.shape[1],
+                        image_shape[1] / y_synth.shape[2])
+        y_train = zoom(y_synth, zoom_factors, order=1).astype(np.float32)
+        print(f"  Фантомы переразмерены с {y_synth.shape[1:]} → "
+              f"{tuple(image_shape)}")
+    else:
+        y_train = y_synth.astype(np.float32)
+
+    # Регенерация измерений через ИЗМЕРЕННУЮ SM — обязательное условие,
+    # чтобы все модели видели данные правильной размерности
+    # (2, M_total/2) complex с M_total = SM.shape[0].
+    print(f"  Регенерация измерений через измеренную SM (SNR 30 dB)...")
+    X_train = _synthesize_measurements_through_SM(y_train, SM, snr_db=30.0)
+    print(f"  X_train: {X_train.shape}, y_train: {y_train.shape}")
 
     # 2) Обучение / загрузка моделей
     print("\n" + "=" * 70)
@@ -604,8 +677,8 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
         expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'Shang(2022)', 'CNN'),
-        n_train_samples=64,
-        epochs=30,
+        n_train_samples=32,
+        epochs=15,
         mode='spatial',
     )
     if moe is not None:
