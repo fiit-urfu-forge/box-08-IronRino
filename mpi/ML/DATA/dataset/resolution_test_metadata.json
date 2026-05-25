@@ -1,0 +1,152 @@
+[
+  {
+    "distance": 0.05,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.05,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.05,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.08888888888888889,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.08888888888888889,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.08888888888888889,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.12777777777777777,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.12777777777777777,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.12777777777777777,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.16666666666666669,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.16666666666666669,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.16666666666666669,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.20555555555555555,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.20555555555555555,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.20555555555555555,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.24444444444444446,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.24444444444444446,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.24444444444444446,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.2833333333333333,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.2833333333333333,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.2833333333333333,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.32222222222222224,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.32222222222222224,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.32222222222222224,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.3611111111111111,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.3611111111111111,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.3611111111111111,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  },
+  {
+    "distance": 0.4,
+    "particle_size_nm": 30,
+    "theoretical_resolution_mm": 0.3333333333333333
+  },
+  {
+    "distance": 0.4,
+    "particle_size_nm": 40,
+    "theoretical_resolution_mm": 0.25
+  },
+  {
+    "distance": 0.4,
+    "particle_size_nm": 50,
+    "theoretical_resolution_mm": 0.2
+  }
+]
