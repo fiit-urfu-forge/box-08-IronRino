@@ -163,7 +163,13 @@ class MoDLNetwork(nn.Module):
 
 
 class _DiffusionUNet(nn.Module):
-    """Маленький U-Net для denoise-шага DDPM с time embedding."""
+    """Маленький U-Net для denoise-шага DDPM с time embedding.
+
+    Args:
+        in_channels:  размерность входа = 1 (noisy image) + n_condition_channels
+                      (условие, обычно Tikhonov-реконструкция).
+        base, time_dim: ёмкость + размерность time-embedding.
+    """
 
     def __init__(self, in_channels: int, base: int = 64,
                  time_dim: int = 64):
@@ -234,21 +240,28 @@ class _DiffusionUNet(nn.Module):
 
 
 class DiffusionModel(nn.Module):
-    """Упрощённая DDPM модель для генерации MPI-изображения по condition.
+    """Conditional DDPM для MPI: денойзинг GT-концентрации с условием.
 
-    Используется только как baseline: q-sampling добавляет шум к
-    концентрации, U-Net учится его предсказывать; в инференсе делается
-    обратный процесс p_sample.
+    Условие (`condition`) — это, как правило, грубая реконструкция из
+    Tikhonov или Kaczmarz, передаётся U-Net'у конкатенацией с зашумлённым
+    x_t. Это превращает безусловный baseline в задачно-ориентированную
+    модель «улучши грубую реконструкцию до GT»; loss = MSE между
+    предсказанным шумом и реальным.
+
+    Если `condition=None`, модель работает в безусловном режиме.
+
+    Args:
+        cond_channels: число каналов condition (1 для Tikhonov-recon).
     """
 
     def __init__(self, n_steps: int = 100,
                  image_size: int = 51, base_filters: int = 64,
                  beta_start: float = 1e-4, beta_end: float = 0.02,
-                 in_channels: int = 4):
+                 cond_channels: int = 1):
         super().__init__()
         self.n_steps = n_steps
         self.image_size = image_size
-        self.in_channels = in_channels
+        self.cond_channels = cond_channels
 
         betas = torch.linspace(beta_start, beta_end, n_steps)
         alphas = 1.0 - betas
@@ -261,9 +274,20 @@ class DiffusionModel(nn.Module):
         self.register_buffer('sqrt_one_minus_alphas_cumprod',
                              torch.sqrt(1.0 - alphas_cumprod))
 
-        # Сеть принимает (x_t, condition) — в нашем случае condition
-        # передаётся через начальное состояние x_t
-        self.unet = _DiffusionUNet(in_channels=1, base=base_filters)
+        # Вход U-Net: noisy (1 канал) + condition (cond_channels)
+        self.unet = _DiffusionUNet(in_channels=1 + cond_channels,
+                                   base=base_filters)
+
+    def _concat_cond(self, x_t: torch.Tensor,
+                     condition: torch.Tensor) -> torch.Tensor:
+        if condition is None:
+            zeros = torch.zeros(x_t.shape[0], self.cond_channels,
+                                *x_t.shape[-2:], device=x_t.device)
+            return torch.cat([x_t, zeros], dim=1)
+        if condition.shape[-2:] != x_t.shape[-2:]:
+            condition = F.interpolate(condition, size=x_t.shape[-2:],
+                                       mode='bilinear', align_corners=False)
+        return torch.cat([x_t, condition], dim=1)
 
     def q_sample(self, x_start: torch.Tensor,
                  t: torch.Tensor,
@@ -274,9 +298,11 @@ class DiffusionModel(nn.Module):
         sqom = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
         return sqa * x_start + sqom * noise
 
-    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """Один обратный шаг диффузии."""
-        eps_pred = self.unet(x_t, t)
+    def p_sample(self, x_t: torch.Tensor, t: torch.Tensor,
+                 condition: torch.Tensor = None) -> torch.Tensor:
+        """Один обратный шаг диффузии (с conditioning)."""
+        inp = self._concat_cond(x_t, condition)
+        eps_pred = self.unet(inp, t)
         alpha = self.alphas[t][:, None, None, None]
         alpha_bar = self.alphas_cumprod[t][:, None, None, None]
         beta = self.betas[t][:, None, None, None]
@@ -288,15 +314,37 @@ class DiffusionModel(nn.Module):
         return mean
 
     def forward(self, x_start: torch.Tensor,
-                t: torch.Tensor = None) -> torch.Tensor:
-        """Тренировочный forward: возвращает MSE между шумом и предсказанием."""
+                t: torch.Tensor = None,
+                condition: torch.Tensor = None) -> torch.Tensor:
+        """Тренировочный forward: возвращает MSE между шумом и предсказанием.
+
+        Args:
+            x_start:   (B, 1, H, W) ground-truth концентрация.
+            t:         (B,) индексы шагов диффузии; если None — случайные.
+            condition: (B, cond_channels, H, W) грубая реконструкция
+                       (Tikhonov или Kaczmarz). None = безусловный режим.
+        """
         if t is None:
             t = torch.randint(0, self.n_steps, (x_start.shape[0],),
                               device=x_start.device)
         noise = torch.randn_like(x_start)
         x_noisy = self.q_sample(x_start, t, noise)
-        eps_pred = self.unet(x_noisy, t)
+        inp = self._concat_cond(x_noisy, condition)
+        eps_pred = self.unet(inp, t)
         return F.mse_loss(eps_pred, noise)
+
+    def sample(self, condition: torch.Tensor,
+               n_steps: int = None) -> torch.Tensor:
+        """Условное сэмплирование: condition → x_0 (B, 1, H, W)."""
+        n_steps = n_steps or self.n_steps
+        device = condition.device
+        B = condition.shape[0]
+        H, W = condition.shape[-2:]
+        x = torch.randn(B, 1, H, W, device=device)
+        for step in reversed(range(min(n_steps, self.n_steps))):
+            t = torch.full((B,), step, device=device, dtype=torch.long)
+            x = self.p_sample(x, t, condition)
+        return x
 
 
 __all__ = ['MPIReconstructionCNN', 'MoDLNetwork', 'DiffusionModel']

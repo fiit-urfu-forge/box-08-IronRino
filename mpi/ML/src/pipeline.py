@@ -112,6 +112,44 @@ def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True):
 
 
 # ---------------------------------------------------------------------------
+# Cross-validation параметра μ для Tikhonov-реконструктора
+# ---------------------------------------------------------------------------
+
+
+def tune_tikhonov_mu(SM, X_val, y_val,
+                     mus=(1e-4, 1e-3, 1e-2, 1e-1, 1.0),
+                     kmax: int = 30,
+                     n_val_samples: int = 16) -> float:
+    """Выбрать `μ` для Tikhonov, минимизирующий MSE на валидационной выборке.
+
+    Tikhonov даёт SSIM 0.5–0.95 в зависимости от уровня шума, а
+    оптимальный μ — порядка σ²_шума / σ²_сигнала. Подбираем на
+    маленькой выборке (16–32 образца) перед сравнением.
+    """
+    from .models.classical import TikhonovReconstructor
+    tik = TikhonovReconstructor(SM)
+    n_use = min(n_val_samples, len(X_val))
+    idx = np.random.choice(len(X_val), n_use, replace=False)
+    best_mu, best_mse = None, float('inf')
+    print("  Подбор μ для Tikhonov:")
+    for mu in mus:
+        losses = []
+        for i in idx:
+            m = X_val[i]
+            v = np.concatenate([m[0], m[1]])
+            recon = tik.reconstruct(v, mu=mu, kmax=kmax).reshape(*y_val.shape[1:])
+            losses.append(np.mean((recon - y_val[i]) ** 2))
+        mse = float(np.mean(losses))
+        marker = ''
+        if mse < best_mse:
+            best_mu, best_mse = mu, mse
+            marker = '  ← новый минимум'
+        print(f"    μ={mu:.0e}  MSE={mse:.4e}{marker}")
+    print(f"  → выбран μ={best_mu:.0e} (MSE={best_mse:.4e})")
+    return best_mu
+
+
+# ---------------------------------------------------------------------------
 # 2. Обучение / загрузка моделей
 # ---------------------------------------------------------------------------
 
@@ -210,7 +248,7 @@ def _format_for_modl_deq(X_complex):
 # --- CNN baseline -----------------------------------------------------------
 
 def train_or_load_cnn(X_train, y_train, train: bool = True,
-                      epochs: int = 20, output_size=(51, 51)):
+                      epochs: int = 40, output_size=(51, 51)):
     print("\n  CNN baseline (UNet)...")
     path = './DATA/models/cnn_best.pth'
     trainer = ModelTrainerFactory.create_cnn_trainer(
@@ -236,7 +274,7 @@ def train_or_load_cnn(X_train, y_train, train: bool = True,
 # --- MoDL baseline ----------------------------------------------------------
 
 def train_or_load_modl(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 15):
+                       train: bool = True, epochs: int = 30):
     print("\n  MoDL baseline...")
     path = './DATA/models/modl_best.pth'
     trainer = ModelTrainerFactory.create_modl_trainer(
@@ -263,26 +301,65 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
 
 # --- Diffusion baseline -----------------------------------------------------
 
-def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 10):
-    print("\n  Diffusion baseline (DDPM)...")
+def train_or_load_diffusion(y_train, X_train, SM,
+                            train: bool = True, epochs: int = 25):
+    """Conditional DDPM: condition = Tikhonov-реконструкция из измерения.
+
+    Без conditioning Diffusion безполезен для нашей задачи (генерирует
+    «правдоподобные», но не соответствующие измерению карты). С condition'ом
+    он учится «отшумливать» грубую Tikhonov-реконструкцию до GT.
+    """
+    print("\n  Diffusion baseline (conditional DDPM с Tikhonov-condition)...")
     path = './DATA/models/diffusion_best.pth'
+    image_size = y_train.shape[-1]
     trainer = ModelTrainerFactory.create_diffusion_trainer(
-        n_steps=100, image_size=51, base_filters=64,
+        n_steps=100, image_size=image_size, base_filters=32,
     )
     if not train and os.path.exists(path):
-        ckpt = torch.load(path, map_location='cpu')
+        ckpt = torch.load(path, map_location=device())
         trainer.model.load_state_dict(ckpt['model_state_dict'], strict=False)
         print("    загружена")
         return trainer
 
-    # Diffusion (безусловный) — учится восстанавливать чистые y_train
+    # Precompute Tikhonov-condition для каждого X_train (медленно, но один раз)
+    from .models.classical import TikhonovReconstructor
+    tik = TikhonovReconstructor(SM)
     n = min(500, len(y_train))
     sel = np.random.choice(len(y_train), n, replace=False)
+    print(f"    Прекомьют Tikhonov-condition для {n} образцов...")
+    conditions = np.zeros((n, *y_train.shape[1:]), dtype=np.float32)
+    for k, i in enumerate(tqdm(sel, desc='      tik-cond')):
+        v = np.concatenate([X_train[i, 0], X_train[i, 1]])
+        conditions[k] = tik.reconstruct(v, mu=1e-2, kmax=15).reshape(*y_train.shape[1:])
+        # Нормализация на [0, 1]
+        if conditions[k].max() > 0:
+            conditions[k] = conditions[k] / conditions[k].max()
     targets = torch.tensor(y_train[sel, None], dtype=torch.float32)
-    ds = TensorDataset(targets, targets)  # measurements не используются
+    cond_t = torch.tensor(conditions[:, None], dtype=torch.float32)
+
+    # Тренировочный цикл: передаём condition напрямую в model.forward
+    dev = device()
+    model = trainer.model.to(dev)
+    ds = TensorDataset(targets, cond_t)
     loader = DataLoader(ds, batch_size=8, shuffle=True)
-    losses, _ = trainer.train(loader, loader, epochs=epochs, save_path=path)
-    _save_curve(losses, 'Diffusion',
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    losses = []
+    best = float('inf')
+    for ep in tqdm(range(epochs), desc='    Diffusion'):
+        ep_loss = 0.0
+        for yb, cb in loader:
+            yb = yb.to(dev); cb = cb.to(dev)
+            opt.zero_grad()
+            loss = model(yb, condition=cb)
+            loss.backward()
+            opt.step()
+            ep_loss += loss.item()
+        avg = ep_loss / len(loader)
+        losses.append(avg)
+        if avg < best:
+            best = avg
+            torch.save({'model_state_dict': model.state_dict()}, path)
+    _save_curve(losses, 'Diffusion (conditional)',
                 './DATA/results/training_curves/diffusion_training.png')
     return trainer
 
@@ -290,7 +367,7 @@ def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 10):
 # --- Chae 2017 (single + multi layer) ---------------------------------------
 
 def train_or_load_chae(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 30):
+                       train: bool = True, epochs: int = 60):
     """Возвращает (single_layer_model, multi_layer_model) согласно статье."""
     print("\n  Chae (2017) — single + multi-layer FC...")
     in_dim = _model_input_dim(X_train)
@@ -300,7 +377,9 @@ def train_or_load_chae(SM, image_shape, X_train, y_train,
 
     dev = device()
     single = ChaeSingleLayerNN(in_dim, out_dim).to(dev)
-    multi = ChaeMultiLayerNN(in_dim, out_dim, hidden_dim=200).to(dev)
+    # hidden_dim=None → default max(200, 1.5·out_dim), что выполняет требование
+    # статьи Chae 2017 о hidden ≥ output (иначе сеть не обучается)
+    multi = ChaeMultiLayerNN(in_dim, out_dim, hidden_dim=None).to(dev)
 
     if not train and os.path.exists(path_single) and os.path.exists(path_multi):
         single.load_state_dict(torch.load(path_single, map_location=dev),
@@ -347,24 +426,31 @@ def build_dip(image_shape):
 # --- Shang 2022 FDS-MPI -----------------------------------------------------
 
 def train_or_load_shang(X_train, y_train, SM, train: bool = True,
-                        epochs: int = 20):
+                        epochs: int = 40):
     print("\n  Shang (2022) FDS-MPI dual-branch...")
     path = './DATA/models/shang_best.pth'
     dev = device()
-    model = ShangCNN(input_channels=1, output_channels=1, base_filters=32).to(dev)
+    # base_filters=64 как в статье Shang 2022 (см. Sec. 3.2: "the number
+    # of filters of the other layers was set to 64")
+    model = ShangCNN(input_channels=1, output_channels=1, base_filters=64).to(dev)
     if not train and os.path.exists(path):
         model.load_state_dict(torch.load(path, map_location=dev),
                               strict=False)
         print("    загружена")
         return model
 
-    # FDS-MPI — постпроцессинг: на вход даём грубую X-space-подобную
-    # реконструкцию (через псевдо-обратную SM), цель — точный y.
-    A_pinv = np.linalg.pinv(SM)
+    # FDS-MPI — постпроцессинг: на вход даём грубую LOW-RES реконструкцию,
+    # цель — точное y. В статье вход — это X-space-реконструкция при
+    # слабом градиенте. Здесь используем Tikhonov как ближайший аналог
+    # (гладкое регуляризованное решение). Это критично: чистая
+    # псевдо-обратная матрица на шумящих данных взрывается, и сеть
+    # учится «гладить» взрыв вместо повышения разрешения.
+    from .models.classical import TikhonovReconstructor
+    tik = TikhonovReconstructor(SM)
     inputs = []
     for m in X_train:
         v = np.concatenate([m[0], m[1]])
-        recon = (A_pinv @ v).real.reshape(*y_train.shape[1:])
+        recon = tik.reconstruct(v, mu=1e-2, kmax=15).reshape(*y_train.shape[1:])
         inputs.append(recon)
     X_lr = np.array(inputs, dtype=np.float32)[:, None]
     y_hr = y_train.astype(np.float32)[:, None]
@@ -392,12 +478,17 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
 # --- DEQ-MPI ----------------------------------------------------------------
 
 def train_or_load_deq(SM, image_shape, X_train, y_train,
-                      train: bool = True, epochs: int = 15):
+                      train: bool = True, epochs: int = 40):
     print("\n  DEQ-MPI (Güngör 2024) — RDN + LC...")
     path = './DATA/models/deq_best.pth'
     dev = device()
+    # Архитектура строго из статьи Güngör 2024 Sec IV.A:
+    # n_res=4, F_R=12, n_conv=12, n_LC=1, F_LC=8, ε=√M, 25 итер с Anderson.
     model = DEQMPI(system_matrix=SM, image_shape=image_shape,
-                   n_iterations=5, rdn_channels=32, n_rdn_modules=2).to(dev)
+                   n_iterations=25, lambda_param=1.0,
+                   rdn_channels=12, n_rdn_modules=4,
+                   rdn_convs_per_module=12,
+                   lc_hidden=8, use_anderson=True).to(dev)
     if not train and os.path.exists(path):
         ckpt = torch.load(path, map_location=dev)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
@@ -406,10 +497,29 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
 
     X_real = _format_for_modl_deq(X_train)
     y_img = y_train[:, None].astype(np.float32)
+
+    # КРИТИЧНО (статья Sec V.A): pre-train RDN и LC отдельно перед
+    # основным обучением. Без этого PSNR падает на 7–17 dB.
+    pretrain_eps = max(5, epochs // 3)
+    print(f"    [init 1/2] Pre-train RDN как denoiser ({pretrain_eps} эп., σ₁=0.1)...")
+    y_img_t = torch.tensor(y_img)
+    model.pretrain_rdn(y_img_t, sigma1=0.1, epochs=pretrain_eps, lr=1e-3,
+                       batch_size=8)
+    print(f"    [init 2/2] Pre-train LC как L2-проекция ({pretrain_eps} эп., σ₂=0.05, σ₃=0.02)...")
+    # Чистые измерения y_clean = SM @ y_train (без шума)
+    y_clean = np.zeros_like(X_real)
+    for i in range(len(y_img)):
+        c = y_img[i, 0].flatten()
+        u_re = model.A.cpu().numpy() @ c
+        y_clean[i] = u_re
+    model.pretrain_lc(torch.tensor(y_clean), sigma2=0.05, sigma3=0.02,
+                      epochs=pretrain_eps, lr=1e-3, batch_size=8)
+
     ds = TensorDataset(torch.tensor(X_real), torch.tensor(y_img))
     loader = DataLoader(ds, batch_size=8, shuffle=True)
-    crit = torch.nn.MSELoss()
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    crit = torch.nn.L1Loss()  # статья: L1 на выходе
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3,
+                           betas=(0.9, 0.999))  # статья: Adam β=(0.9, 0.999)
     losses = []
     best = float('inf')
     for ep in tqdm(range(epochs), desc='    DEQ'):
@@ -454,9 +564,9 @@ def build_pmcnet_trio(SM, image_shape,
     })
     final = PMCNetFinal(image_shape, n_meas,
                         config=final_cfg, n_colors=n_colors)
-    print(f"    1) Standard          (S из калибровки)")
-    print(f"    2) Physics-Enhanced  (S из аналитической физики)")
-    print(f"    3) Final             (физика + Debye + multi-color + TV)")
+    print(f"    1) Standard          (S из калибровки сканера)")
+    print(f"    2) Physics-Enhanced  (hard-constraint форвард, PCNN-стиль)")
+    print(f"    3) Final             (hard-constraint + Debye + multi-color + TV)")
     return standard, phys, final
 
 
@@ -727,7 +837,7 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
 
     cnn = train_or_load_cnn(X_train, y_train, train=train_models)
     modl = train_or_load_modl(SM, image_shape, X_train, y_train, train=train_models)
-    diff = train_or_load_diffusion(y_train, train=train_models)
+    diff = train_or_load_diffusion(y_train, X_train, SM, train=train_models)
     chae_single, chae_multi = train_or_load_chae(
         SM, image_shape, X_train, y_train, train=train_models)
     dip = build_dip(image_shape)
@@ -751,14 +861,20 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     cmp.set_pmcnet_physics_enhanced(pmcnet_phys)
     cmp.set_pmcnet_final(pmcnet_final)
 
+    # 2.4) Cross-validation параметра μ для Tikhonov на этом наборе
+    best_mu = tune_tikhonov_mu(SM, X_train, y_train,
+                                mus=(1e-4, 1e-3, 1e-2, 1e-1, 1.0),
+                                kmax=20, n_val_samples=12)
+    cmp.set_tikhonov_mu(best_mu)
+
     # 2.5) MoE поверх быстрых экспертов
     moe = build_moe(
         comparator=cmp,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
         expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'Shang(2022)', 'CNN'),
-        n_train_samples=64,
-        epochs=40,
+        n_train_samples=128,
+        epochs=80,
         mode='spatial',
     )
     if moe is not None:

@@ -196,12 +196,22 @@ class MPIReconstructionComparator:
         measurement_reshaped = measurement.reshape(2, -1)
         return measurement_reshaped
 
-    def tikhonov_reconstruction(self, measurement, mu=0.001, kmax=100):
+    def tikhonov_reconstruction(self, measurement, mu=None, kmax=100):
+        """Tikhonov-реконструкция. μ берётся из `self.tikhonov_mu`
+        (выставляется через `set_tikhonov_mu()` после cross-validation),
+        либо из аргумента, либо 1e-3 по умолчанию.
+        """
+        if mu is None:
+            mu = getattr(self, 'tikhonov_mu', 1e-3)
         recon = self.tikhonov_reconstructor.reconstruct(measurement, mu, kmax)
         recon = np.asarray(recon).reshape(self.image_shape)
         if recon.max() > 0:
             recon = recon / recon.max()
         return recon
+
+    def set_tikhonov_mu(self, mu: float):
+        """Задать μ для Tikhonov (после `tune_tikhonov_mu` в pipeline)."""
+        self.tikhonov_mu = float(mu)
 
     # ====================================================================
     # МЕТОД 1: Chae (2017) - Однослойная полносвязная нейронная сеть
@@ -305,13 +315,14 @@ class MPIReconstructionComparator:
             # Прямой оператор
             measurement_pred = generated_flat @ self.A_tensor_T
 
-            # Loss: несоответствие измерениям + регуляризация тотальной вариации
-            data_loss = torch.mean((measurement_pred - meas_tensor) ** 2)
-
-            # TV регуляризация
-            tv_loss = self._total_variation(generated_image)
-
-            loss = data_loss + 0.01 * tv_loss
+            # Loss: L1 на сигнал — статья Dittmer 2020 (Sec. II.C) явно
+            # рекомендует p=1, а не p=2: "throughout this paper we will
+            # use p = 1". L1 устойчивее на негауссовом шуме MPI и в
+            # сочетании с авто-регуляризацией DIP-архитектуры (без skip)
+            # даёт лучший PSNR/SSIM. TV-регуляризацию НЕ добавляем —
+            # статья опирается ИСКЛЮЧИТЕЛЬНО на implicit regularization
+            # от архитектуры (раздел II.C, заключение).
+            loss = torch.mean(torch.abs(measurement_pred - meas_tensor))
             loss.backward()
             optimizer.step()
 
@@ -344,17 +355,17 @@ class MPIReconstructionComparator:
         if self.shang_model is None:
             raise ValueError("Shang модель не установлена")
 
-        real_part = measurement.real
-        imag_part = measurement.imag
-        meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-
-        # Для Shang CNN нужен вход в виде изображения
-        # Сначала делаем грубую реконструкцию через псевдообращение
+        # FDS-MPI ждёт LOW-RES изображение на входе. Используем Tikhonov
+        # (тот же преобразователь, на котором обучалась сеть), а не
+        # сырое псевдо-обращение — иначе шум полностью «забивает» вход
+        # и сеть учит mapping шум→GT.
+        meas_vector = np.concatenate([measurement[0, :], measurement[1, :]])
         try:
-            A_pinv = np.linalg.pinv(self.SM)
-            initial_recon = (A_pinv @ meas_vector).reshape(self.image_shape)
-        except:
-            initial_recon = np.zeros(self.image_shape)
+            initial_recon = self.tikhonov_reconstructor.reconstruct(
+                meas_vector, mu=1e-2, kmax=15).reshape(self.image_shape)
+        except Exception:
+            initial_recon = np.zeros(self.image_shape, dtype=np.float32)
+        initial_recon = initial_recon.astype(np.float32)
 
         dev = self._model_device(self.shang_model)
         input_tensor = torch.tensor(initial_recon, dtype=torch.float32,
@@ -570,33 +581,40 @@ class MPIReconstructionComparator:
         return reconstructed
 
     def diffusion_reconstruction(self, measurement):
-        """Реконструкция методом диффузионной модели"""
+        """Условная реконструкция: condition = Tikhonov-recon измерения.
+
+        Diffusion обучен в режиме «уточни грубую Tikhonov-реконструкцию
+        до GT», поэтому inference тоже идёт с этим условием.
+        """
         if self.diffusion_trainer is None:
             raise ValueError("Diffusion модель не установлена")
 
-        import torch
+        # 1) Грубая Tikhonov-реконструкция как condition
+        meas_vector = np.concatenate([measurement[0, :], measurement[1, :]])
+        try:
+            cond = self.tikhonov_reconstructor.reconstruct(
+                meas_vector, mu=1e-2, kmax=15).reshape(self.image_shape)
+        except Exception:
+            cond = np.zeros(self.image_shape, dtype=np.float32)
+        cond = cond.astype(np.float32)
+        if cond.max() > 0:
+            cond = cond / cond.max()
 
-        real_part = measurement.real
-        imag_part = measurement.imag
-        meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32).unsqueeze(0).to(self.diffusion_trainer.device)
+        dev = self._model_device(self.diffusion_trainer.model)
+        cond_tensor = torch.tensor(cond[None, None],
+                                    dtype=torch.float32, device=dev)
 
+        # 2) Условное сэмплирование (50 шагов из 100)
         self.diffusion_trainer.model.eval()
         with torch.no_grad():
-            # Для диффузионной модели нужен обратный процесс
-            batch_size = meas_tensor.shape[0]
-            x_t = torch.randn(batch_size, 1, self.nx, self.ny).to(self.diffusion_trainer.device)
-
-            # Упрощенная версия обратного процесса
-            for t in reversed(range(min(50, self.diffusion_trainer.model.n_steps))):
-                t_tensor = torch.full((batch_size,), t, device=self.diffusion_trainer.device, dtype=torch.long)
-                x_t = self.diffusion_trainer.model.p_sample(x_t, t_tensor)
-
-            reconstructed = x_t[0, 0].cpu().numpy()
+            x = self.diffusion_trainer.model.sample(
+                cond_tensor,
+                n_steps=min(50, self.diffusion_trainer.model.n_steps),
+            )
+            reconstructed = x[0, 0].cpu().numpy()
 
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
-
         return reconstructed
 
     def load_openmpi_data(self, data_dir=None):
@@ -874,7 +892,7 @@ class MPIReconstructionComparator:
         # Список всех методов с их источниками
         methods = [
             ('Тихонов', self.tikhonov_reconstruction, "Tikhonov (1963)"),
-            ('KatsMarc', lambda m: self.katsmarc_reconstruction(m, n_iterations=20) if self.katsmarc else None,
+            ('KatsMarc', lambda m: self.katsmarc_reconstruction(m, n_iterations=5) if self.katsmarc else None,
              "Kaczmarz (1937)"),
             ('Chae(2017)', self.chae_reconstruction if self.chae_model else None, "Chae - Single Layer NN"),
             ('DIP(2020)', lambda m: self.dip_reconstruction(m, n_iterations=300) if self.dip_model else None,

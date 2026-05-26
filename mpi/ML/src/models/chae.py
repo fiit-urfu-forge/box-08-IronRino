@@ -27,17 +27,17 @@ import torch.nn as nn
 class ChaeSingleLayerNN(nn.Module):
     """Однослойный перцептрон с сигмоидной активацией (Chae 2017, Sec. II.A).
 
-    Архитектура буквально из статьи: y = σ(W·x + b), без скрытых слоёв.
-    Анализ W показывает, что её столбцы стремятся к полиномам Чебышёва
-    второго рода — это, по сути, обучаемое псевдо-обращение системной
-    матрицы.
+    Архитектура буквально из статьи: y = σ(W·x), **без bias** (статья:
+    "Considering no bias terms"). Анализ W показывает, что её столбцы
+    стремятся к полиномам Чебышёва второго рода — это, по сути,
+    обучаемое псевдо-обращение системной матрицы.
     """
 
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
-        self.fc = nn.Linear(input_dim, output_dim)
+        self.fc = nn.Linear(input_dim, output_dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.fc(x))
@@ -46,21 +46,31 @@ class ChaeSingleLayerNN(nn.Module):
 class ChaeMultiLayerNN(nn.Module):
     """Двухслойная сеть со скрытым слоем (Chae 2017, Sec. II.B).
 
-    Архитектура из статьи: y = σ(W₂ · σ(W₁·x + b₁) + b₂).
-    Скрытый слой — 200 нейронов в оригинале; в общем случае задаётся
-    параметром `hidden_dim`. Добавление нелинейного слоя усиливает
-    классификационные свойства сети и снижает MSE на два порядка.
+    Архитектура из статьи: y = σ(W₂ · σ(W₁·x)). Скрытый слой в
+    оригинале 200 нейронов (для output_dim=129).
+
+    **Критичный момент из статьи (Sec. III.3):** «The training is
+    difficult to achieve for a number of hidden units smaller than the
+    length of the target vector». То есть `hidden_dim ≥ output_dim`
+    обязательно. Поэтому default — `max(200, ⌈1.5·output_dim⌉)`,
+    а не фиксированные 200.
+
+    Bias-термов нет, как в статье.
     """
 
-    def __init__(self, input_dim: int, output_dim: int, hidden_dim: int = 200):
+    def __init__(self, input_dim: int, output_dim: int,
+                 hidden_dim: int = None):
         super().__init__()
+        if hidden_dim is None:
+            # Гарантируем hidden ≥ output (см. doc)
+            hidden_dim = max(200, int(output_dim * 1.5))
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.hidden_dim = hidden_dim
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim, bias=False),
             nn.Sigmoid(),
-            nn.Linear(hidden_dim, output_dim),
+            nn.Linear(hidden_dim, output_dim, bias=False),
             nn.Sigmoid(),
         )
 

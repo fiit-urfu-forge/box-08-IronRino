@@ -88,28 +88,38 @@ class KatsMarcAlgorithm:
         self.row_norms_sq = np.einsum('ij,ij->i', self.A_real, self.A_real)
         self.row_norms_sq = np.clip(self.row_norms_sq, 1e-30, None)
 
-    def reconstruct(self, measurement, n_iterations=20, relaxation=1.0,
-                    enforce_nonneg=True):
-        """Восстановление.
+    def reconstruct(self, measurement, n_iterations=5, relaxation=0.5,
+                    enforce_nonneg=True, damp_schedule=True):
+        """Восстановление с защитой от шума (early stopping + затухание).
+
+        Kaczmarz без регуляризации расходится на зашумлённых данных —
+        каждый проход «выпиливает» шум обратно в решение. Защита:
+          • короткий по умолчанию `n_iterations=5` — ранняя остановка;
+          • `relaxation < 1` (под-релаксация) гасит вклад каждой строки;
+          • `damp_schedule=True` — λ_k = relaxation / √k уменьшает шаг с
+            итерациями (Polyak-стиль);
+          • `enforce_nonneg=True` — после каждого прохода проектируем
+            x ≥ 0, что физически соответствует концентрации МНЧ и
+            подавляет осциллирующий шум.
 
         Args:
             measurement: (M,) или (2, M/2).
             n_iterations: число полных проходов по строкам.
-            relaxation: параметр λ (1.0 — стандартный Качмарц,
-                        <1 — недо-релаксация, >1 — пере-релаксация).
-            enforce_nonneg: жёсткая проекция на неотрицательность после
-                            каждого прохода.
+            relaxation:   базовая λ (0.5 — устойчиво на SNR ≥ 20 дБ).
+            enforce_nonneg: проекция на положительный конус.
+            damp_schedule:  использовать λ_k = relaxation / √k.
         """
         b = self._normalize_measurement(measurement)
         x = np.zeros(self.N, dtype=np.float64)
 
-        for _ in range(n_iterations):
+        for k in range(n_iterations):
+            lam = relaxation / np.sqrt(k + 1) if damp_schedule else relaxation
             order = (np.random.permutation(self.M)
                      if self.use_random_order else range(self.M))
             for i in order:
                 a_i = self.A_real[i]
                 residual = b[i] - a_i @ x
-                x = x + relaxation * residual / self.row_norms_sq[i] * a_i
+                x = x + lam * residual / self.row_norms_sq[i] * a_i
             if enforce_nonneg:
                 x = np.maximum(x, 0)
 

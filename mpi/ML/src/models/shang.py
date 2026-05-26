@@ -23,73 +23,90 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _conv_bn_relu(c_in: int, c_out: int, kernel: int = 5):
+    """Свёртка + BatchNorm + ReLU — стандартный блок FDS-MPI из статьи.
+
+    Статья Shang 2022 (Fig. 1) явно показывает BatchNorm после каждой
+    свёртки. Без BN на малых батчах (как у нас, batch=16) обучение
+    становится нестабильным, поэтому BN критичен для воспроизводимости
+    качества из статьи (SSIM 0.94, PSNR 28 dB на MNIST-фантомах).
+    """
+    p = kernel // 2
+    return nn.Sequential(
+        nn.Conv2d(c_in, c_out, kernel, padding=p, bias=False),
+        nn.BatchNorm2d(c_out),
+        nn.ReLU(inplace=True),
+    )
+
+
 class _BranchA(nn.Module):
     """Подсеть с пулингом (artifact-suppression branch).
 
     Encoder с двумя MaxPool ×2 → bottleneck → decoder с двумя
     ConvTranspose ×2. Residual connection от входа на выход (1×1 conv).
+    Все conv-слои с BN+ReLU.
     """
 
     def __init__(self, in_channels: int = 1, base: int = 64,
                  kernel: int = 5):
         super().__init__()
-        p = kernel // 2
-        self.conv1 = nn.Conv2d(in_channels, base, kernel, padding=p)
-        self.conv2 = nn.Conv2d(base, base, kernel, padding=p)
-        self.conv3 = nn.Conv2d(base, base, kernel, padding=p)
+        self.enc1 = _conv_bn_relu(in_channels, base, kernel)
+        self.enc2 = _conv_bn_relu(base, base, kernel)
+        self.enc3 = _conv_bn_relu(base, base, kernel)
         self.pool = nn.MaxPool2d(2)
 
-        self.up1 = nn.ConvTranspose2d(base, base, kernel_size=2, stride=2)
-        self.up2 = nn.ConvTranspose2d(base, base, kernel_size=2, stride=2)
-        self.deconv = nn.Conv2d(base, base, kernel, padding=p)
+        # ConvTranspose с BN+ReLU
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(base, base, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(base, base, kernel_size=2, stride=2, bias=False),
+            nn.BatchNorm2d(base),
+            nn.ReLU(inplace=True),
+        )
+        self.deconv = _conv_bn_relu(base, base, kernel)
 
-        # Residual: 1×1 для приведения каналов входа к base
         self.skip = nn.Conv2d(in_channels, base, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         orig_size = x.shape[-2:]
         residual = self.skip(x)
-
-        h = self.act(self.conv1(x))
-        h = self.pool(h)                       # H/2
-        h = self.act(self.conv2(h))
-        h = self.pool(h)                       # H/4
-        h = self.act(self.conv3(h))
-        h = self.act(self.up1(h))              # H/2
-        h = self.act(self.up2(h))              # H
-
+        h = self.pool(self.enc1(x))            # H/2
+        h = self.pool(self.enc2(h))            # H/4
+        h = self.enc3(h)
+        h = self.up1(h)                        # H/2
+        h = self.up2(h)                        # H
         if h.shape[-2:] != orig_size:
             h = F.interpolate(h, size=orig_size,
                               mode='bilinear', align_corners=False)
-        h = self.act(self.deconv(h))
+        h = self.deconv(h)
         return h + residual
 
 
 class _BranchB(nn.Module):
     """Подсеть без пулинга (detail-preserving branch).
 
-    Чисто свёрточная цепочка с residual connection. Никакого
-    пространственного сжатия — мелкие структуры сохраняются.
+    Чисто свёрточная цепочка с residual connection. Все conv-слои с
+    BatchNorm+ReLU (см. статью Fig. 1).
     """
 
     def __init__(self, in_channels: int = 1, base: int = 64,
                  kernel: int = 5):
         super().__init__()
-        p = kernel // 2
-        self.conv1 = nn.Conv2d(in_channels, base, kernel, padding=p)
-        self.conv2 = nn.Conv2d(base, base, kernel, padding=p)
-        self.conv3 = nn.Conv2d(base, base, kernel, padding=p)
-        self.conv4 = nn.Conv2d(base, base, kernel, padding=p)
+        self.conv1 = _conv_bn_relu(in_channels, base, kernel)
+        self.conv2 = _conv_bn_relu(base, base, kernel)
+        self.conv3 = _conv_bn_relu(base, base, kernel)
+        self.conv4 = _conv_bn_relu(base, base, kernel)
         self.skip = nn.Conv2d(in_channels, base, kernel_size=1)
-        self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.skip(x)
-        h = self.act(self.conv1(x))
-        h = self.act(self.conv2(h))
-        h = self.act(self.conv3(h))
-        h = self.act(self.conv4(h))
+        h = self.conv1(x)
+        h = self.conv2(h)
+        h = self.conv3(h)
+        h = self.conv4(h)
         return h + residual
 
 

@@ -562,6 +562,129 @@ class AnalyticalForwardModel(nn.Module):
 
 
 # =============================================================================
+# Hard-constraint декомпозиция (Maxwell-PCNN-стиль, Scheinker 2023)
+# =============================================================================
+
+
+class HardConstrainedSpectralForward(nn.Module):
+    """Прямой оператор «жёсткой физики», встроенный в архитектуру сети.
+
+    Этот блок заменяет линейный `SystemMatrixForward (S·c)` полной цепочкой
+    фиксированных дифференцируемых физических слоёв. Все законы взяты из
+    theory.md (раздел «Основное уравнение MPI»):
+
+        H_sel(r)   = G·r                                  [Eq. selection_field]
+        r_FFP(t)   = (A/G)·sin(2π·f·t)                    [Eq. ffp_trajectory]
+        H(r,t)     = H_sel(r − r_FFP(t)) + H_exc(t)       [Eq. total_field]
+        m(r,t)     = m_sat · L(μ₀·m_sat·|H|/(k_B·T)) · ê  [Eq. langevin]
+        L(ξ)       = coth(ξ) − 1/ξ                        [Eq. langevin_func]
+        ∂m/∂t      через Conv1d ядром [−1, 0, +1]/(2Δt)   [Eq. derivative]
+        a(r,t)     = −μ₀ · s(r) · ∂m/∂t                   [Eq. system_function]
+        s(r)       = 1 / (1 + (|r|/R_coil)²)              [Eq. coil_sensitivity]
+        u(t)       = ∫_Ω a(r,t) · c(r) dr                 [Eq. main_mpi]
+        U(f)       = FFT_t{u(t)}; первые M/2 гармоник на катушку.
+
+    Аналогия с Maxwell-PCNN (Scheinker 2023, Eq. 6):
+      • PCNN: B = ∇×A — фиксированная свёртка (W_curl) на выходе сети
+        гарантирует ∇·B = 0 _by construction_ (Eq. 14).
+      • Здесь: вся цепочка операторов на выходе U-Net гарантирует
+        согласованность u(t) с физикой MPI _by construction_, без
+        штрафов в loss и без предвычисленной линейной аппроксимации S.
+
+    Отличие от `SystemMatrixForward + build_analytical_system_matrix`:
+      • S·c — это _предвычисленная_ линейная матрица; физика «застывает»
+        в момент сборки SM (R_coil, m_sat, f_x фиксированы при build).
+      • HardConstrainedSpectralForward — _архитектурный_ блок: на каждом
+        форварде физика пересчитывается через дифференцируемые слои,
+        поэтому любой физический параметр потенциально доступен для
+        joint blind calibration (через `nn.Parameter` с softplus).
+
+    Математически линеен по `c` (как и S·c), но реализован как функция
+    `c → u_freq`, а не как умножение на матрицу. Выход нормирован тем
+    же масштабом, что и `build_analytical_system_matrix` (SM_max → 1),
+    чтобы существующий формат measurement / loss работали без изменений.
+    """
+
+    def __init__(self, config: 'PMCNetConfig', n_meas_bins: int):
+        super().__init__()
+        if n_meas_bins % 2 != 0:
+            raise ValueError(
+                f"n_meas_bins ({n_meas_bins}) должно быть чётным "
+                f"(по половине на каждую катушку)"
+            )
+        self.n_meas_bins = int(n_meas_bins)
+        self.n_freq_per_coil = self.n_meas_bins // 2
+
+        # Гарантируем nyquist-условие: T ≥ 2·n_freq_per_coil
+        cfg = config
+        if cfg.n_time_samples < 2 * self.n_freq_per_coil:
+            cfg = PMCNetConfig(**{
+                **config.__dict__,
+                'n_time_samples': 2 * self.n_freq_per_coil,
+            })
+        self._Nx, self._Ny = cfg.image_size
+
+        # Физический форвард: вся theory.md внутри (Eq. 1–13, 16)
+        self.physics = AnalyticalForwardModel(cfg)
+
+        # Нормировочный множитель: max |U(f)| на единичную «дельта» концентрации.
+        # Совпадает с SM_max в `build_analytical_system_matrix`, поэтому
+        # выход согласован по масштабу с предвычисленной нормированной SM.
+        with torch.no_grad():
+            Mx, My = self.physics._compute_magnetization()    # (Nx, Ny, T)
+            dMx = self.physics.ddt(Mx)
+            dMy = self.physics.ddt(My)
+            s = self.physics.coil.sensitivity                  # (Nx, Ny)
+            scale = -self.physics.langevin.mu0 * self.physics.dA
+            kx = scale * s.unsqueeze(-1) * dMx                 # (Nx, Ny, T)
+            ky = scale * s.unsqueeze(-1) * dMy
+            T = kx.shape[-1]
+            Kx_freq = torch.fft.rfft(kx.reshape(-1, T), dim=-1)
+            Ky_freq = torch.fft.rfft(ky.reshape(-1, T), dim=-1)
+            sm_max = torch.cat([
+                Kx_freq[:, :self.n_freq_per_coil].abs().flatten(),
+                Ky_freq[:, :self.n_freq_per_coil].abs().flatten(),
+            ]).max().clamp_min(1e-30)
+        self.register_buffer('output_scale', sm_max)
+
+    @property
+    def M(self) -> int:
+        return self.n_meas_bins
+
+    @property
+    def N(self) -> int:
+        return self._Nx * self._Ny
+
+    def forward(self, c_flat: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """c_flat: (B, N) → (u_real, u_imag), оба (B, M).
+
+        Полная цепочка: c → AnalyticalForwardModel (theory.md Eq. 1–13)
+        → rfft по времени → первые M/2 гармоник на каждую катушку
+        → деление на output_scale.
+        """
+        B = c_flat.shape[0]
+        if c_flat.shape[1] != self._Nx * self._Ny:
+            raise ValueError(
+                f"c_flat имеет {c_flat.shape[1]} пикселей, "
+                f"ожидалось {self._Nx * self._Ny}"
+            )
+        c_img = c_flat.view(B, 1, self._Nx, self._Ny)
+
+        # Полный физический форвард по theory.md Eq. 1–13
+        u_time = self.physics(c_img)                           # (B, 2, T)
+
+        # Преобразование в частотную область — формат measurement
+        U_x = torch.fft.rfft(u_time[:, 0], dim=-1)             # (B, T//2+1)
+        U_y = torch.fft.rfft(u_time[:, 1], dim=-1)
+        U = torch.cat([
+            U_x[:, :self.n_freq_per_coil],
+            U_y[:, :self.n_freq_per_coil],
+        ], dim=-1) / self.output_scale                          # (B, M) complex
+        return U.real, U.imag
+
+
+# =============================================================================
 # Backbone: U-Net без shallow skip-связей
 # =============================================================================
 
@@ -763,6 +886,109 @@ class PMCNetWithRefinedPhysics(nn.Module):
 
 
 # =============================================================================
+# PMCNet с hard-constraint форвардом (PCNN-стиль)
+# =============================================================================
+
+
+class PMCNetHardConstrained(nn.Module):
+    """PMCNet, где S·c заменено цепочкой фиксированных физических слоёв.
+
+    Single-color аналог `PMCNet`: U-Net φ_θ(z) → c, затем
+    `HardConstrainedSpectralForward(c) → (u_real, u_imag)`. Loss остаётся
+    L1 в частотной области (формат measurement не меняется), а вся физика
+    зашита в архитектуру форварда по уравнениям theory.md (см. док-стринг
+    `HardConstrainedSpectralForward`).
+    """
+
+    def __init__(self, image_shape: Tuple[int, int],
+                 n_meas_bins: int,
+                 config: 'PMCNetConfig'):
+        super().__init__()
+        self.image_shape = tuple(image_shape)
+        self.unet = PMCNetUNet(image_size=self.image_shape, out_channels=1,
+                               base=config.base_channels)
+        self.forward_op = HardConstrainedSpectralForward(config, n_meas_bins)
+
+    def forward(self, z: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c = self.unet(z)                          # (B, 1, H, W), σ ∈ [0,1]
+        c_flat = c.view(c.shape[0], -1)
+        u_real, u_imag = self.forward_op(c_flat)
+        return c, u_real, u_imag
+
+
+class PMCNetHardConstrainedRefined(nn.Module):
+    """PMCNet с hard-constraint форвардом + Debye + multi-color.
+
+    Multi-color аналог `PMCNetWithRefinedPhysics`: U-Net выдаёт K
+    концентраций c_1,…,c_K, для каждой считается hard-constrained сигнал,
+    далее каждый канал умножается на частотный отклик релаксации
+    H_τ_k(f) = 1 / (1 + j·2π·f·τ_k) (см. док-стринг
+    `DebyeRelaxationFilter`), и каналы складываются.
+
+    Декомпозиция по цветам — прямой аналог декомпозиции компонент в
+    Maxwell-PCNN (Scheinker 2023, Eq. 10): каждая A_k зависит только
+    от соответствующей J_k, поэтому K параллельных скалярных подсетей
+    компактнее, чем одна K-канальная.
+    """
+
+    def __init__(self, image_shape: Tuple[int, int],
+                 n_meas_bins: int,
+                 config: 'PMCNetConfig',
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        super().__init__()
+        self.config = config
+        self.image_shape = tuple(image_shape)
+        self.n_colors = config.n_colors
+
+        self.unet = PMCNetUNet(image_size=self.image_shape,
+                               out_channels=self.n_colors,
+                               base=config.base_channels)
+        self.forward_op = HardConstrainedSpectralForward(config, n_meas_bins)
+        self.debye = DebyeRelaxationFilter(n_colors=self.n_colors,
+                                            init_tau=config.init_tau_seconds)
+
+        M = self.forward_op.M
+        if harmonic_frequencies_hz is None:
+            freqs = (np.arange(1, M + 1, dtype=np.float32)
+                     * config.drive_frequency_x)
+        else:
+            freqs = np.asarray(harmonic_frequencies_hz,
+                               dtype=np.float32).flatten()
+            if freqs.size != M:
+                raise ValueError(
+                    f"harmonic_frequencies_hz должен содержать {M} элементов, "
+                    f"получено {freqs.size}"
+                )
+        self.register_buffer('freqs_hz',
+                             torch.tensor(freqs, dtype=torch.float32))
+
+    def total_concentration(self, c: torch.Tensor) -> torch.Tensor:
+        return c.sum(dim=1, keepdim=True)
+
+    def forward(self, z: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c = self.unet(z)  # (B, K, H, W)
+        B = c.shape[0]
+        device = c.device
+
+        u_real_total = torch.zeros(B, self.forward_op.M, device=device)
+        u_imag_total = torch.zeros(B, self.forward_op.M, device=device)
+
+        for k in range(self.n_colors):
+            c_k = c[:, k, :, :].reshape(B, -1)
+            u_r, u_i = self.forward_op(c_k)
+            if self.config.use_debye:
+                H = self.debye.freq_response(self.freqs_hz, color_idx=k)
+                Hr, Hi = H.real, H.imag
+                u_r, u_i = u_r * Hr - u_i * Hi, u_r * Hi + u_i * Hr
+            u_real_total = u_real_total + u_r
+            u_imag_total = u_imag_total + u_i
+
+        return c, u_real_total, u_imag_total
+
+
+# =============================================================================
 # Реконструкторы (data-free per-measurement optimization)
 # =============================================================================
 
@@ -928,6 +1154,149 @@ class PMCNetRefinedReconstructor(_BaseReconstructor):
         self.network.train()
 
         c_np = c[0].cpu().numpy()  # (n_colors, H, W)
+        if self.config.n_colors == 1:
+            c_np = c_np[0]
+        return c_np, taus
+
+
+class PMCNetHardConstrainedReconstructor(_BaseReconstructor):
+    """Реконструктор для PMCNet с hard-constraint форвардом.
+
+    API идентично `PMCNetReconstructor`: `reconstruct(measurement)` принимает
+    комплексный вектор гармоник, оптимизирует L1 в частотной области.
+    Под капотом — не S·c, а полный физический форвард
+    (см. `HardConstrainedSpectralForward`).
+    """
+
+    def __init__(self, image_shape: Tuple[int, int], n_meas_bins: int,
+                 config: Optional[PMCNetConfig] = None):
+        cfg = config or PMCNetConfig(image_size=tuple(image_shape))
+        cfg = PMCNetConfig(**{**cfg.__dict__,
+                              'image_size': tuple(image_shape)})
+        net = PMCNetHardConstrained(image_shape, n_meas_bins, cfg)
+        super().__init__(net, cfg)
+        self.image_shape = tuple(image_shape)
+
+    def reconstruct(self, measurement, n_iterations: Optional[int] = None,
+                    verbose: bool = False, reset: bool = True) -> np.ndarray:
+        n_iter = n_iterations or self.config.n_iterations
+        u_real, u_imag = self._measurement_to_tensors(measurement)
+        M = self.network.forward_op.M
+        if u_real.numel() != M:
+            raise ValueError(
+                f"Измерение содержит {u_real.numel()} бинов, ожидалось {M}."
+            )
+
+        if reset:
+            self._reset_unet_weights()
+
+        torch.manual_seed(self.config.seed)
+        z = torch.randn(1, 1, *self.image_shape, device=self.device)
+
+        optimizer = torch.optim.Adam(self.network.parameters(),
+                                     lr=self.config.learning_rate)
+        self.loss_history.clear()
+
+        iterator = range(n_iter)
+        if verbose:
+            iterator = tqdm(iterator, desc='PMCNet-HardConstrained')
+
+        for it in iterator:
+            optimizer.zero_grad()
+            c, ur, ui = self.network(z)
+            loss = (ur[0] - u_real).abs().mean() + (ui[0] - u_imag).abs().mean()
+            if self.config.lambda_tv > 0:
+                loss = loss + self.config.lambda_tv * self._tv_loss(c)
+            loss.backward()
+            optimizer.step()
+            self.loss_history.append(loss.item())
+            if verbose and (it % max(1, n_iter // 20) == 0):
+                iterator.set_postfix({'loss': f'{loss.item():.4e}'})
+
+        self.network.eval()
+        with torch.no_grad():
+            c, _, _ = self.network(z)
+        self.network.train()
+        return c[0, 0].detach().cpu().numpy()
+
+
+class PMCNetHardConstrainedRefinedReconstructor(_BaseReconstructor):
+    """Реконструктор для `PMCNetHardConstrainedRefined`.
+
+    Возвращает кортеж (концентрация, оценённые τ_k), как
+    `PMCNetRefinedReconstructor`. Hard-constraint форвард + Debye в
+    частотной области (математически эквивалентен временной свёртке,
+    но дешевле, т.к. FFT уже посчитан в выходе форварда).
+    """
+
+    def __init__(self, image_shape: Tuple[int, int], n_meas_bins: int,
+                 config: Optional[PMCNetConfig] = None,
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = config or PMCNetConfig(image_size=tuple(image_shape),
+                                      use_debye=True)
+        cfg = PMCNetConfig(**{**cfg.__dict__,
+                              'image_size': tuple(image_shape)})
+        net = PMCNetHardConstrainedRefined(
+            image_shape, n_meas_bins, cfg,
+            harmonic_frequencies_hz=harmonic_frequencies_hz,
+        )
+        super().__init__(net, cfg)
+        self.image_shape = tuple(image_shape)
+
+    def reconstruct(self, measurement, n_iterations: Optional[int] = None,
+                    verbose: bool = False, reset: bool = True
+                    ) -> Tuple[np.ndarray, np.ndarray]:
+        n_iter = n_iterations or self.config.n_iterations
+        u_real, u_imag = self._measurement_to_tensors(measurement)
+        M = self.network.forward_op.M
+        if u_real.numel() != M:
+            raise ValueError(
+                f"Измерение содержит {u_real.numel()} бинов, ожидалось {M}."
+            )
+
+        if reset:
+            self._reset_unet_weights()
+            init_raw = DebyeRelaxationFilter._tau_to_raw(
+                self.config.init_tau_seconds
+            )
+            with torch.no_grad():
+                self.network.debye.raw_tau.fill_(init_raw)
+
+        torch.manual_seed(self.config.seed)
+        z = torch.randn(1, 1, *self.image_shape, device=self.device)
+
+        optimizer = torch.optim.Adam(self.network.parameters(),
+                                     lr=self.config.learning_rate)
+        self.loss_history.clear()
+
+        iterator = range(n_iter)
+        if verbose:
+            iterator = tqdm(iterator, desc='PMCNet-HardConstrained-Refined')
+
+        for it in iterator:
+            optimizer.zero_grad()
+            c, ur, ui = self.network(z)
+            loss = (ur[0] - u_real).abs().mean() + (ui[0] - u_imag).abs().mean()
+            if self.config.lambda_tv > 0:
+                loss = loss + self.config.lambda_tv * self._tv_loss(c)
+            loss.backward()
+            optimizer.step()
+            self.loss_history.append(loss.item())
+            if verbose and (it % max(1, n_iter // 20) == 0):
+                tau_us = (self.network.debye.tau_seconds * 1e6
+                          ).detach().cpu().numpy()
+                iterator.set_postfix({
+                    'loss': f'{loss.item():.4e}',
+                    'tau_us': np.array2string(tau_us, precision=3),
+                })
+
+        self.network.eval()
+        with torch.no_grad():
+            c, _, _ = self.network(z)
+            taus = self.network.debye.tau_seconds.detach().cpu().numpy()
+        self.network.train()
+
+        c_np = c[0].cpu().numpy()
         if self.config.n_colors == 1:
             c_np = c_np[0]
         return c_np, taus
@@ -1225,23 +1594,40 @@ class PMCNetStandard(PMCNetReconstructor):
     """
 
 
-class PMCNetPhysicsEnhanced(PMCNetReconstructor):
-    """PMCNet с улучшенной физикой, но без NN-оптимизаций.
+class PMCNetPhysicsEnhanced(PMCNetHardConstrainedReconstructor):
+    """PMCNet с улучшенной физикой: hard-constraint форвард в духе Maxwell-PCNN.
 
-    Отличие от Standard — где взять системную матрицу:
-      • Standard:        S из калибровки реального сканера;
-      • PhysicsEnhanced: S вычислена из физики MPI напрямую, через
-                         `build_analytical_system_matrix`:
-            – стабильный Langevin (langevin_safe, 5-членный Тейлор +
-              устойчивая coth + асимптотика);
-            – радиальная чувствительность s(r) = 1/(1+(r/R_coil)²);
-            – траектория Лиссажу r_FFP(t) = (L/2)·sin(2π·f·t),  f_x ≠ f_y;
-            – центральная конечная разность ∂/∂t через фиксированную
-              свёртку (PCNN Eq. 12–13).
+    Отличие от Standard — _как_ строится прямой оператор:
+      • Standard:        forward = S·c, где S — _измеренная_ SM из
+                         калибровки реального сканера (фиксированная
+                         линейная матрица, физика «застывшая»).
+      • PhysicsEnhanced: forward — _архитектурная_ цепочка фиксированных
+                         дифференцируемых слоёв, реализующая ровно
+                         уравнения theory.md, пересчитывается каждую
+                         итерацию (физика «живая», параметры доступны
+                         для будущего blind-calibration).
 
-    Архитектура сети и loss идентичны Standard — улучшения локализованы
-    исключительно в физическом форварде. Это изолирует вклад физики
-    от вклада NN-стороны.
+    Цепочка форварда (theory.md, раздел «Основное уравнение MPI»):
+
+        r_FFP(t)  = (A_E/G)·sin(2π·f·t)                  [Eq. ffp_trajectory]
+        H_sel(r)  = G·r                                  [Eq. selection_field]
+        H(r,t)    = G·(r − r_FFP(t)) + H_exc(t)          [Eq. total_field]
+        m(r,t)    = m_sat·L(μ₀·m_sat·|H|/(k_B·T)) · ê    [Eq. langevin]
+        L(ξ)      = coth(ξ) − 1/ξ                        [Eq. langevin_func]
+                    с устойчивыми ветвями ξ/3 (малые) и 1−1/ξ
+                    (большие) согласно Eq. langevin_approx
+        ∂m/∂t     ≈ (m_{k+1} − m_{k−1}) / (2Δt) через
+                    Conv1d с _фиксированным_ ядром [−1, 0, +1]/(2Δt)
+                    (Eq. derivative); идея — Scheinker 2023, Eq. 12–13
+        a(r,t)    = −μ₀·s(r)·∂m/∂t                       [Eq. system_function]
+        s(r)      = 1 / (1 + (|r|/R_coil)²)              [Eq. coil_sensitivity]
+        u(t)      = Σ_{i,j} a(x_i,y_j,t)·c(x_i,y_j)·ΔxΔy [Eq. numerical_integration]
+        U(f)      = FFT_t{u(t)}; первые M/2 гармоник на катушку.
+
+    Все законы зашиты _в архитектуру_ форварда (как `B = ∇×A` в PCNN
+    Eq. 6 Scheinker 2023), а не в loss. Никаких NN-улучшений сверх
+    этого: single color, без Дебая, без TV — чтобы изолированно
+    оценить вклад «hard-constraint физики» от вклада NN-стороны.
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1255,36 +1641,44 @@ class PMCNetPhysicsEnhanced(PMCNetReconstructor):
             'use_debye': False,
             'lambda_tv': 0.0,
         })
-        SM_analytical = build_analytical_system_matrix(image_shape, n_meas_bins, cfg)
-        super().__init__(SM_analytical, image_shape, config=cfg)
+        super().__init__(image_shape, n_meas_bins, config=cfg)
 
 
-class PMCNetFinal(PMCNetRefinedReconstructor):
-    """Финальная PMCNet: улучшенная физика + полный набор NN-оптимизаций.
+class PMCNetFinal(PMCNetHardConstrainedRefinedReconstructor):
+    """Финальный PMCNet: hard-constraint физика + полный набор NN-оптимизаций.
 
-    Поверх PhysicsEnhanced добавлены NN-улучшения, описанные нами и
-    инспирированные Maxwell-PCNN-статьёй:
+    Поверх PhysicsEnhanced (та же архитектурная цепочка theory.md,
+    Eq. main_mpi … Eq. coil_sensitivity) добавлены NN-улучшения, прямо
+    инспирированные Maxwell-PCNN (Scheinker 2023):
 
-      • Релаксация Дебая (Eq. 4–5 PMCNet) применяется как частотный
-        фильтр H_{τ_k}(f) = 1/(1 + j·2π·f·τ_k) поверх S·c_k. Каждая τ_k
-        обучается градиентным спуском через softplus-параметризацию,
-        гарантирующую положительность.
+      • Релаксация Дебая (Eq. 4–5 статьи PMCNet, восходящая к
+        дифференциальной форме τ·dM_D/dt = −M_D + M, theory.md
+        раздел «Численная реализация»): применяется как частотный
+        фильтр H_τ_k(f) = 1 / (1 + j·2π·f·τ_k) к выходу форварда.
+        Каждая τ_k обучается через softplus-параметризацию
+        (положительность _by construction_, как и c через sigmoid).
 
-      • Multi-color: U-Net выводит K концентраций c_1, …, c_K (по числу
-        типов МНЧ), сигналы Σ_k H_{τ_k}(f)·(S·c_k) складываются. Это
-        прямой аналог декомпозиции по компонентам из Maxwell-PCNN
-        (Eq. 10: каждая компонента A_k зависит только от соответствующей
-        J_k).
+      • Multi-color (K цветов МНЧ): U-Net выводит K концентраций
+        c_1, …, c_K; итоговый сигнал — сумма
+            U(f) = Σ_k H_τ_k(f) · ForwardOp(c_k).
+        Это прямой аналог декомпозиции компонент в Maxwell-PCNN
+        (Scheinker 2023, Eq. 10): каждая компонента A_k зависит только
+        от своей J_k, поэтому K скалярных подсетей компактнее одной
+        K-канальной. У нас аналогично: c_k → u_k(f) независимо.
 
-      • TV-регуляризация на c для подавления шума (default λ_TV = 1e-3).
+      • TV-регуляризация на c (Σ_k λ·∑|∇c_k|) для подавления шума
+        реконструкции; default λ_TV = 1e-3.
 
-      • Hard constraints by construction (PCNN-стиль):
-            – sigmoid в head → c ∈ [0, 1] всегда, а не штрафом;
-            – радиальная s(r) включена в синтетическую SM
-              → невозможно переоценить интенсивность у границ FOV.
-
-    Системная матрица — аналитическая (та же, что и в PhysicsEnhanced),
-    что позволяет напрямую сравнивать все три варианта.
+      • Hard constraints _by construction_ (PCNN-философия):
+            – sigmoid в head U-Net  → c ∈ [0, 1] архитектурно;
+            – softplus(raw_τ)        → τ_k > 0 архитектурно;
+            – радиальная s(r) — фиксированный буфер по
+              Eq. coil_sensitivity, не штраф в loss;
+            – ядро [−1, 0, +1]/(2Δt) для ∂/∂t — фиксированный буфер
+              по Eq. derivative, аналог W_∂x в PCNN Eq. 12–13;
+            – вся цепочка theory.md встроена в архитектуру форварда,
+              поэтому u(t) согласован с физикой MPI _by construction_
+              без штрафов в loss и без предвычисленной линейной SM.
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1299,8 +1693,7 @@ class PMCNetFinal(PMCNetRefinedReconstructor):
             'use_debye': True,
             'lambda_tv': max(base.lambda_tv, 1e-3),
         })
-        SM_analytical = build_analytical_system_matrix(image_shape, n_meas_bins, cfg)
-        super().__init__(SM_analytical, image_shape, config=cfg)
+        super().__init__(image_shape, n_meas_bins, config=cfg)
 
 
 __all__ = [
@@ -1312,6 +1705,7 @@ __all__ = [
     'TimeDerivativeFD',
     'LangevinMagnetization',
     'AnalyticalForwardModel',
+    'HardConstrainedSpectralForward',
     # Дебай и SM-форвард
     'DebyeRelaxationFilter',
     'SystemMatrixForward',
@@ -1321,10 +1715,14 @@ __all__ = [
     'PMCNet',
     'PMCNetWithRefinedPhysics',
     'PMCNetWithAnalyticalPhysics',
+    'PMCNetHardConstrained',
+    'PMCNetHardConstrainedRefined',
     # Низкоуровневые реконструкторы
     'PMCNetReconstructor',
     'PMCNetRefinedReconstructor',
     'PMCNetAnalyticalReconstructor',
+    'PMCNetHardConstrainedReconstructor',
+    'PMCNetHardConstrainedRefinedReconstructor',
     # Три названных варианта (pipeline-ready)
     'PMCNetStandard',
     'PMCNetPhysicsEnhanced',

@@ -15,9 +15,9 @@ from src.pipeline import run_pipeline  # noqa: E402
 
 if __name__ == '__main__':
     # Параметры запуска
-    NUM_SAMPLES = 1000          # размер синтетического обучающего датасета
+    NUM_SAMPLES = 3000          # размер синтетического обучающего датасета
     TRAIN_MODELS = True         # False — загружать сохранённые веса
-    PMCNET_ITER = 500           # итераций оптимизации на одно измерение
+    PMCNET_ITER = 3000          # итераций оптимизации на одно измерение
 
     # Валидация на OpenMPIData (https://github.com/MagneticParticleImaging/OpenMPIData.jl)
     # ВЫКЛЮЧЕНА по умолчанию. Чтобы включить — поставьте True. Данные
