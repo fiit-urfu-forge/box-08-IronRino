@@ -41,7 +41,9 @@ from .models import (
     DeepImagePrior, ShangCNN, DEQMPI,
     PMCNetConfig, PMCNetStandard, PMCNetPhysicsEnhanced, PMCNetFinal,
     MoEReconstructor,
+    build_analytical_system_matrix,
 )
+from .data.phantoms import PhantomGenerator
 from .trainer import MPITrainer, ModelTrainerFactory
 from .comparator import MPIReconstructionComparator
 
@@ -208,7 +210,7 @@ def _format_for_modl_deq(X_complex):
 # --- CNN baseline -----------------------------------------------------------
 
 def train_or_load_cnn(X_train, y_train, train: bool = True,
-                      epochs: int = 5, output_size=(51, 51)):
+                      epochs: int = 20, output_size=(51, 51)):
     print("\n  CNN baseline (UNet)...")
     path = './DATA/models/cnn_best.pth'
     trainer = ModelTrainerFactory.create_cnn_trainer(
@@ -234,7 +236,7 @@ def train_or_load_cnn(X_train, y_train, train: bool = True,
 # --- MoDL baseline ----------------------------------------------------------
 
 def train_or_load_modl(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 5):
+                       train: bool = True, epochs: int = 15):
     print("\n  MoDL baseline...")
     path = './DATA/models/modl_best.pth'
     trainer = ModelTrainerFactory.create_modl_trainer(
@@ -261,7 +263,7 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
 
 # --- Diffusion baseline -----------------------------------------------------
 
-def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 3):
+def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 10):
     print("\n  Diffusion baseline (DDPM)...")
     path = './DATA/models/diffusion_best.pth'
     trainer = ModelTrainerFactory.create_diffusion_trainer(
@@ -288,7 +290,7 @@ def train_or_load_diffusion(y_train, train: bool = True, epochs: int = 3):
 # --- Chae 2017 (single + multi layer) ---------------------------------------
 
 def train_or_load_chae(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 10):
+                       train: bool = True, epochs: int = 30):
     """Возвращает (single_layer_model, multi_layer_model) согласно статье."""
     print("\n  Chae (2017) — single + multi-layer FC...")
     in_dim = _model_input_dim(X_train)
@@ -296,13 +298,14 @@ def train_or_load_chae(SM, image_shape, X_train, y_train,
     path_single = './DATA/models/chae_single_best.pth'
     path_multi = './DATA/models/chae_multi_best.pth'
 
-    single = ChaeSingleLayerNN(in_dim, out_dim)
-    multi = ChaeMultiLayerNN(in_dim, out_dim, hidden_dim=200)
+    dev = device()
+    single = ChaeSingleLayerNN(in_dim, out_dim).to(dev)
+    multi = ChaeMultiLayerNN(in_dim, out_dim, hidden_dim=200).to(dev)
 
     if not train and os.path.exists(path_single) and os.path.exists(path_multi):
-        single.load_state_dict(torch.load(path_single, map_location='cpu'),
+        single.load_state_dict(torch.load(path_single, map_location=dev),
                                strict=False)
-        multi.load_state_dict(torch.load(path_multi, map_location='cpu'),
+        multi.load_state_dict(torch.load(path_multi, map_location=dev),
                               strict=False)
         print("    загружены")
         return single, multi
@@ -320,6 +323,7 @@ def train_or_load_chae(SM, image_shape, X_train, y_train,
         for ep in tqdm(range(epochs), desc=f'    {label}'):
             ep_loss = 0.0
             for xb, yb in loader:
+                xb = xb.to(dev); yb = yb.to(dev)
                 opt.zero_grad()
                 loss = crit(model(xb), yb)
                 loss.backward()
@@ -336,18 +340,20 @@ def train_or_load_chae(SM, image_shape, X_train, y_train,
 
 def build_dip(image_shape):
     print("\n  DIP (Dittmer 2020) — data-free, без обучения.")
-    return DeepImagePrior(image_shape, latent_channels=1, base_channels=32)
+    return DeepImagePrior(image_shape, latent_channels=1,
+                          base_channels=32).to(device())
 
 
 # --- Shang 2022 FDS-MPI -----------------------------------------------------
 
 def train_or_load_shang(X_train, y_train, SM, train: bool = True,
-                        epochs: int = 5):
+                        epochs: int = 20):
     print("\n  Shang (2022) FDS-MPI dual-branch...")
     path = './DATA/models/shang_best.pth'
-    model = ShangCNN(input_channels=1, output_channels=1, base_filters=32)
+    dev = device()
+    model = ShangCNN(input_channels=1, output_channels=1, base_filters=32).to(dev)
     if not train and os.path.exists(path):
-        model.load_state_dict(torch.load(path, map_location='cpu'),
+        model.load_state_dict(torch.load(path, map_location=dev),
                               strict=False)
         print("    загружена")
         return model
@@ -370,6 +376,7 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
     for ep in tqdm(range(epochs), desc='    Shang'):
         ep_loss = 0.0
         for xb, yb in loader:
+            xb = xb.to(dev); yb = yb.to(dev)
             opt.zero_grad()
             loss = crit(model(xb), yb)
             loss.backward()
@@ -385,13 +392,14 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
 # --- DEQ-MPI ----------------------------------------------------------------
 
 def train_or_load_deq(SM, image_shape, X_train, y_train,
-                      train: bool = True, epochs: int = 5):
+                      train: bool = True, epochs: int = 15):
     print("\n  DEQ-MPI (Güngör 2024) — RDN + LC...")
     path = './DATA/models/deq_best.pth'
+    dev = device()
     model = DEQMPI(system_matrix=SM, image_shape=image_shape,
-                   n_iterations=5, rdn_channels=32, n_rdn_modules=2)
+                   n_iterations=5, rdn_channels=32, n_rdn_modules=2).to(dev)
     if not train and os.path.exists(path):
-        ckpt = torch.load(path, map_location='cpu')
+        ckpt = torch.load(path, map_location=dev)
         model.load_state_dict(ckpt['model_state_dict'], strict=False)
         print("    загружена")
         return model
@@ -407,6 +415,7 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
     for ep in tqdm(range(epochs), desc='    DEQ'):
         ep_loss = 0.0
         for xb, yb in loader:
+            xb = xb.to(dev); yb = yb.to(dev)
             opt.zero_grad()
             y_pred = model(xb)
             loss = crit(y_pred, yb)
@@ -564,23 +573,94 @@ def build_moe(comparator, image_shape,
 
 
 # ---------------------------------------------------------------------------
-# 3+4. Финальное сравнение
+# 3. Батарея фантомов: 6 типов × 2 пути генерации измерений
 # ---------------------------------------------------------------------------
 
 
-def run_full_comparison(comparator,
-                        radius: float = 0.2,
-                        distances=(0.2, 0.15, 0.1, 0.05, 0.025)):
-    """Запустить сравнение всех привязанных к comparator методов."""
+def build_phantom_battery(SM_measured, image_shape,
+                          snr_db: float = 30.0,
+                          random_seed: int = 0):
+    """Сгенерировать батарею фантомов × методов для финального сравнения.
+
+    Включены 6 типов 2D-фантомов:
+      • two_droplets — две капли (классический тест разрешения);
+      • phantom_4    — четыре угловые капли;
+      • rotation_45  — крест с маркерами, повёрнутый на 45°;
+      • shape_ring   — кольцевой фантом;
+      • random       — случайные капли;
+      • letter_B     — стилизованная буква B (приближение к
+                       MeasurementData_B.h5 из BeihangUniversityData).
+
+    Для каждого фантома измерения генерируются ДВУМЯ путями (как в
+    статье Chae 2017):
+      • method='sm'      — через ИЗМЕРЕННУЮ системную матрицу (реальная
+                            калибровка сканера);
+      • method='physical' — через АНАЛИТИЧЕСКУЮ системную матрицу,
+                            вычисленную из физики (Langevin + радиальная
+                            s(r) + Лиссажу). Имеет ту же форму, что и
+                            измеренная — все модели работают одинаково.
+
+    Итого 6 × 2 = 12 экспериментов.
+
+    Returns:
+        list[dict]: каждый элемент — {'label', 'image', 'measurement',
+                                       'metadata'} для `run_phantom_battery`.
+    """
     print("\n" + "=" * 70)
-    print("3. СРАВНЕНИЕ НА СИНТЕТИЧЕСКИХ ДВУХ-КАПЕЛЬНЫХ ФАНТОМАХ")
+    print("3. СБОРКА БАТАРЕИ ФАНТОМОВ ДЛЯ ФИНАЛЬНОГО СРАВНЕНИЯ")
     print("=" * 70)
-    synthetic_results = comparator.run_full_comparison(
-        radius=radius, distances=list(distances),
-    )
+
+    np.random.seed(random_seed)
+    pg = PhantomGenerator(nx=image_shape[0], ny=image_shape[1])
+
+    # 6 типов фантомов (ground truth)
+    phantoms = [
+        ('two_droplets', pg.two_droplets(radius=0.2, distance=0.2)),
+        ('phantom_4',    pg.phantom_4()),
+        ('rotation_45',  pg.rotation_phantom(angle_deg=45.0)),
+        ('shape_ring',   pg.shape_phantom('ring')),
+        ('random',       pg.random_phantom(n_droplets=5)),
+        ('letter_B',     pg.letter_phantom('B')),
+    ]
+
+    # Аналитическая SM той же формы, что измеренная
+    M_total = SM_measured.shape[0]
+    print(f"  Сборка аналитической SM ({M_total}×{image_shape[0]*image_shape[1]})...")
+    cfg_phys = PMCNetConfig(image_size=tuple(image_shape))
+    SM_analytical = build_analytical_system_matrix(image_shape, M_total, cfg_phys)
+
+    # Для каждого фантома — два измерения (sm + physical)
+    battery = []
+    for phantom_name, image in phantoms:
+        for method_name, SM_used in (('sm', SM_measured),
+                                      ('physical', SM_analytical)):
+            label = f'{phantom_name}__{method_name}'
+            measurement = _synthesize_measurements_through_SM(
+                image[None], SM_used, snr_db=snr_db,
+                random_seed=random_seed,
+            )[0]                              # (2, M_per_coil)
+            battery.append({
+                'label': label,
+                'image': image,
+                'measurement': measurement,
+                'metadata': {'phantom_type': phantom_name,
+                             'generation_method': method_name},
+            })
+
+    print(f"  Готово: {len(battery)} экспериментов "
+          f"({len(phantoms)} фантомов × 2 метода)")
+    return battery
+
+
+def run_full_comparison(comparator, phantom_battery):
+    """Запустить сравнение всех методов на батарее фантомов."""
+    print("\n" + "=" * 70)
+    print(f"3.1. СРАВНЕНИЕ {len(phantom_battery)} ЭКСПЕРИМЕНТОВ × N МЕТОДОВ")
+    print("=" * 70)
+    results = comparator.run_phantom_battery(phantom_battery)
     comparator.print_summary_table()
     comparator.save_results_to_file('./DATA/results/all_methods_summary.txt')
-    return synthetic_results
+    return results
 
 
 def run_openmpi_validation(comparator):
@@ -601,8 +681,8 @@ def run_openmpi_validation(comparator):
 
 
 def run_pipeline(num_samples: int = 2000, train_models: bool = True,
-                 distances=(0.2, 0.15, 0.1, 0.05, 0.025),
-                 pmcnet_iterations: int = 1500):
+                 pmcnet_iterations: int = 1500,
+                 validate_openmpi: bool = False):
     """End-to-end вызов всего пайплайна."""
     print("=" * 70)
     print("PIPELINE: сравнение методов реконструкции MPI")
@@ -677,29 +757,42 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
         expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'Shang(2022)', 'CNN'),
-        n_train_samples=32,
-        epochs=15,
+        n_train_samples=64,
+        epochs=40,
         mode='spatial',
     )
     if moe is not None:
         cmp.set_moe(moe)
 
-    synthetic_results = run_full_comparison(cmp, distances=distances)
+    # 3) Батарея фантомов × методов генерации
+    battery = build_phantom_battery(SM, image_shape, snr_db=30.0)
+    synthetic_results = run_full_comparison(cmp, battery)
 
-    # 4) OpenMPI-валидация
-    openmpi_results = run_openmpi_validation(cmp)
+    # 4) OpenMPI-валидация (опционально, по флагу)
+    if validate_openmpi:
+        openmpi_results = run_openmpi_validation(cmp)
+    else:
+        print("\n" + "=" * 70)
+        print("4. OpenMPI-валидация ПРОПУЩЕНА (validate_openmpi=False)")
+        print("=" * 70)
+        print("  Чтобы включить, передайте validate_openmpi=True или ")
+        print("  запустите run.py с флагом --openmpi.")
+        print("  Данные должны лежать в ../ChineseData/OpenMPIData/")
+        print("  (подпапки calibrations/ и measurements/).")
+        openmpi_results = {}
 
     # 5) Итог
     print("\n" + "=" * 70)
     print("ПАЙПЛАЙН ЗАВЕРШЁН")
     print("=" * 70)
     print("Артефакты:")
-    print("  ./DATA/results/all_methods_summary.txt   — таблица метрик")
-    print("  ./DATA/results/all_methods_r*_d*.png     — изображения по фантомам")
-    print("  ./DATA/results/openmpi_comparison.png    — графики OpenMPI")
-    print("  ./DATA/results/training_curves/          — кривые обучения")
-    print("  ./DATA/results/phantoms/                 — образцы фантомов")
-    print("  ./DATA/models/                           — обученные веса")
+    print("  ./DATA/results/all_methods_summary.txt        — таблица метрик")
+    print("  ./DATA/results/all_methods_<label>.png        — изображения по фантомам")
+    if validate_openmpi:
+        print("  ./DATA/results/openmpi_comparison.png         — графики OpenMPI")
+    print("  ./DATA/results/training_curves/               — кривые обучения")
+    print("  ./DATA/results/phantoms/                      — образцы фантомов")
+    print("  ./DATA/models/                                — обученные веса")
 
     return {'synthetic': synthetic_results, 'openmpi': openmpi_results}
 
@@ -714,12 +807,17 @@ def main():
                         help='Загрузить сохранённые модели')
     parser.add_argument('--pmcnet_iter', type=int, default=1500,
                         help='Итераций оптимизации на одно измерение для PMCNet')
+    parser.add_argument('--openmpi', action='store_true', default=False,
+                        help='Запустить валидацию на OpenMPIData '
+                             '(данные в ../ChineseData/OpenMPIData/). '
+                             'По умолчанию отключено.')
     args = parser.parse_args()
 
     train_models = not args.load if args.load else args.train
     return run_pipeline(num_samples=args.num_samples,
                         train_models=train_models,
-                        pmcnet_iterations=args.pmcnet_iter)
+                        pmcnet_iterations=args.pmcnet_iter,
+                        validate_openmpi=args.openmpi)
 
 
 if __name__ == '__main__':

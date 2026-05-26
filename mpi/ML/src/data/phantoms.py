@@ -151,6 +151,56 @@ class PhantomGenerator:
             )
         return self.normalize(image)
 
+    def letter_phantom(self, letter: str = 'B') -> np.ndarray:
+        """Простой буквенный фантом (B / A / U) — приближение к реальным
+        фантомам из BeihangUniversityData (MeasurementData_{A,B,U}.h5).
+
+        Контуры рисуются по нормированной сетке [−1, 1] в стилизованной
+        форме, чтобы при разных `nx, ny` пропорции сохранялись.
+        """
+        img = np.zeros((self.nx, self.ny), dtype=np.float32)
+
+        def rect(x0, x1, y0, y1, v=1.0):
+            mask = ((self.X >= x0) & (self.X <= x1) &
+                    (self.Y >= y0) & (self.Y <= y1))
+            img[mask] = np.maximum(img[mask], v)
+
+        def disk(cx, cy, r, v=1.0):
+            d2 = (self.X - cx) ** 2 + (self.Y - cy) ** 2
+            mask = d2 <= r * r
+            img[mask] = np.maximum(img[mask], v)
+
+        L = letter.upper()
+        if L == 'B':
+            # Вертикальная палка (left bar) + две полуокружности справа
+            rect(-0.6, -0.4, -0.8, 0.8)
+            disk(-0.1, 0.4, 0.4)
+            disk(-0.1, -0.4, 0.4)
+            disk(0.0, 0.4, 0.22, 0.0)        # вырезаем «дырку» = 0
+            disk(0.0, -0.4, 0.22, 0.0)
+        elif L == 'A':
+            # Две диагонали + горизонтальная перемычка
+            for t in np.linspace(0, 1, 100):
+                # left leg: (−0.6, −0.8) → (0, 0.8)
+                x1 = -0.6 + 0.6 * t; y1 = -0.8 + 1.6 * t
+                # right leg: (0.6, −0.8) → (0, 0.8)
+                x2 = 0.6 - 0.6 * t; y2 = -0.8 + 1.6 * t
+                disk(x1, y1, 0.08)
+                disk(x2, y2, 0.08)
+            rect(-0.3, 0.3, -0.05, 0.05)      # перемычка
+        elif L == 'U':
+            # Две вертикальные палки + нижняя полуокружность
+            rect(-0.6, -0.4, -0.4, 0.8)
+            rect(0.4, 0.6, -0.4, 0.8)
+            for ang in np.linspace(np.pi, 2 * np.pi, 60):
+                cx, cy = 0.5 * np.cos(ang), -0.4 + 0.5 * np.sin(ang)
+                disk(cx, cy, 0.12)
+        else:
+            # Fallback: квадрат
+            rect(-0.4, 0.4, -0.4, 0.4)
+
+        return self.normalize(img)
+
     def pattern_phantom(self, pattern: str = 'checkerboard',
                         frequency: int = 4) -> np.ndarray:
         """Периодические узоры — для тестирования передаточной функции."""

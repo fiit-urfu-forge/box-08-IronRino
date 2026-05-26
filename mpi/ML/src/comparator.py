@@ -206,6 +206,14 @@ class MPIReconstructionComparator:
     # ====================================================================
     # МЕТОД 1: Chae (2017) - Однослойная полносвязная нейронная сеть
     # ====================================================================
+    @staticmethod
+    def _model_device(model):
+        """Возвращает device первого параметра nn.Module (или 'cpu')."""
+        try:
+            return next(model.parameters()).device
+        except (StopIteration, AttributeError):
+            return torch.device('cpu')
+
     def chae_reconstruction(self, measurement):
         """Реконструкция методом Chae (2017) с батчевой обработкой"""
         if self.chae_model is None:
@@ -227,15 +235,16 @@ class MPIReconstructionComparator:
         if hasattr(self.chae_model, 'scaler_mean'):
             meas_vector = (meas_vector - self.chae_model.scaler_mean) / self.chae_model.scaler_scale
 
-        # Предсказание
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32)
+        # Предсказание (на device модели)
+        dev = self._model_device(self.chae_model)
+        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32,
+                                   device=dev)
 
         self.chae_model.eval()
         with torch.no_grad():
             reconstructed_flat = self.chae_model(meas_tensor.unsqueeze(0))
 
-        # Преобразование в изображение
-        reconstructed = reconstructed_flat.numpy().reshape(self.image_shape)
+        reconstructed = reconstructed_flat.cpu().numpy().reshape(self.image_shape)
 
         # Постобработка
         if reconstructed.max() > 0:
@@ -253,35 +262,35 @@ class MPIReconstructionComparator:
 
         import torch.optim as optim
 
-        # Подготовка измерений
+        # Создаем копию модели на device оригинала
+        import copy
+        dip_model = copy.deepcopy(self.dip_model)
+        dev = self._model_device(dip_model)
+        dip_model.train()
+
+        # Подготовка измерений (на том же device)
         real_part = measurement.real
         imag_part = measurement.imag
         meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32).unsqueeze(0)
+        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32,
+                                   device=dev).unsqueeze(0)
 
-        # Создаем копию модели для этого конкретного измерения
-        import copy
-        dip_model = copy.deepcopy(self.dip_model)
-        dip_model.train()
-
-        # Создаем матрицу A для прямого оператора
-        if not hasattr(self, 'A_tensor'):
-            # Создаем расширенную матрицу для комплексных измерений
+        # Создаем матрицу A для прямого оператора (один раз, на нужном device)
+        cache_key = f'_A_tensor_T_{dev}'
+        if not hasattr(self, cache_key):
             if np.iscomplexobj(self.SM):
-                SM_real = np.real(self.SM)
-                SM_imag = np.imag(self.SM)
-                A_extended = np.vstack([SM_real, SM_imag])
+                A_extended = np.vstack([np.real(self.SM), np.imag(self.SM)])
             else:
                 A_extended = self.SM
-
-            self.A_tensor = torch.tensor(A_extended, dtype=torch.float32)
-            self.A_tensor_T = self.A_tensor.T
+            A_tensor = torch.tensor(A_extended, dtype=torch.float32, device=dev)
+            setattr(self, cache_key, A_tensor.T)
+        self.A_tensor_T = getattr(self, cache_key)
 
         # Оптимизатор
         optimizer = optim.Adam(dip_model.parameters(), lr=0.01)
 
-        # Генерируем латентный вектор
-        latent_z = dip_model.generate_random_latent()
+        # Латентный вектор на нужном device
+        latent_z = dip_model.generate_random_latent().to(dev)
         latent_z.requires_grad = True
 
         # Оптимизация
@@ -312,7 +321,7 @@ class MPIReconstructionComparator:
         # Финальная реконструкция
         dip_model.eval()
         with torch.no_grad():
-            reconstructed = dip_model(latent_z)[0, 0].numpy()
+            reconstructed = dip_model(latent_z)[0, 0].cpu().numpy()
 
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
@@ -347,11 +356,13 @@ class MPIReconstructionComparator:
         except:
             initial_recon = np.zeros(self.image_shape)
 
-        input_tensor = torch.tensor(initial_recon, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        dev = self._model_device(self.shang_model)
+        input_tensor = torch.tensor(initial_recon, dtype=torch.float32,
+                                    device=dev).unsqueeze(0).unsqueeze(0)
 
         self.shang_model.eval()
         with torch.no_grad():
-            reconstructed = self.shang_model(input_tensor)[0, 0].numpy()
+            reconstructed = self.shang_model(input_tensor)[0, 0].cpu().numpy()
 
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
@@ -369,11 +380,13 @@ class MPIReconstructionComparator:
         real_part = measurement.real
         imag_part = measurement.imag
         meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32).unsqueeze(0)
+        dev = self._model_device(self.deq_model)
+        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32,
+                                   device=dev).unsqueeze(0)
 
         self.deq_model.eval()
         with torch.no_grad():
-            reconstructed = self.deq_model(meas_tensor)[0, 0].numpy()
+            reconstructed = self.deq_model(meas_tensor)[0, 0].cpu().numpy()
 
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
@@ -823,12 +836,38 @@ class MPIReconstructionComparator:
         plt.close()
 
     def compare_all_methods(self, radius=0.2, distance=0.2):
-        """Сравнение всех доступных методов"""
-        print(f"\nСравнение методов для radius={radius}, distance={distance}")
-        print("-" * 90)
-
+        """Сравнение всех доступных методов на двух-капельном фантоме
+        (legacy API). Делегирует в `compare_all_methods_on_image`."""
         original_image = self.generate_test_case(radius, distance)
         measurement = self.generate_measurement(original_image)
+        label = f'two_droplets_r{radius}_d{distance}'
+        result = self.compare_all_methods_on_image(
+            original_image, measurement, label=label,
+            metadata={'radius': radius, 'distance': distance},
+        )
+        # Совместимость со старыми ключами
+        result['radius'] = radius
+        result['distance'] = distance
+        return result
+
+    def compare_all_methods_on_image(self, original_image, measurement,
+                                     label: str = '',
+                                     metadata: dict = None):
+        """Универсальное сравнение: image + measurement → метрики по всем методам.
+
+        Args:
+            original_image: ground-truth изображение (Nx, Ny) — для метрик.
+            measurement:    (2, M_per_coil) complex — измерение, формат
+                            как из `generate_measurement` (через измеренную
+                            SM) или из аналитической SM такой же формы.
+            label:          строка-идентификатор фантома для отчёта/имён файлов.
+            metadata:       любой dict дополнительных полей (например,
+                            phantom_type, generation_method) — сохраняется
+                            в результате.
+        """
+        metadata = dict(metadata) if metadata else {}
+        print(f"\nСравнение методов для {label or '(unnamed)'}")
+        print("-" * 90)
 
         results = {}
 
@@ -895,20 +934,24 @@ class MPIReconstructionComparator:
                 print(f"{name:<15} {source:<35} ОШИБКА: {str(e)[:50]}")
                 continue
 
-        # Визуализация
-        self._visualize_all_comparison(original_image, results, radius, distance)
+        # Визуализация — имя файла берётся из label
+        safe_label = label.replace(' ', '_').replace('/', '_') or 'unnamed'
+        self._visualize_all_comparison(original_image, results, safe_label,
+                                        metadata)
 
         return {
             'original': original_image,
             'results': results,
-            'radius': radius,
-            'distance': distance
+            'label': label,
+            **metadata,
         }
 
-    def _visualize_all_comparison(self, original, results, radius, distance):
-        """Визуализация сравнения всех методов"""
-        save_path = f'./DATA/results/all_methods_r{radius}_d{distance}.png'
-
+    def _visualize_all_comparison(self, original, results, label, metadata):
+        """Визуализация сравнения всех методов под уникальным именем фантома."""
+        save_path = f'./DATA/results/all_methods_{label}.png'
+        # Для legacy-визуализации передадим radius/distance, если они есть
+        radius = metadata.get('radius', 0.0)
+        distance = metadata.get('distance', 0.0)
         Visualization.plot_all_methods_comparison(
             original, results, radius, distance,
             save_path=save_path, show_plot=False
@@ -948,6 +991,41 @@ class MPIReconstructionComparator:
         self.results = all_results
         return all_results
 
+    def run_phantom_battery(self, battery):
+        """Сравнение всех методов на батарее фантомов.
+
+        Args:
+            battery: список словарей со схемой
+                {'label': str,
+                 'image': np.ndarray (Nx, Ny),
+                 'measurement': np.ndarray (2, M_per_coil) complex,
+                 'metadata': dict (например, {'phantom_type': 'B',
+                                              'generation_method': 'sm'})}
+
+        Возвращает список результатов; также сохраняется в `self.results`,
+        чтобы работали `print_summary_table` и `save_results_to_file`.
+        """
+        print("=" * 90)
+        print(f"БАТАРЕЯ ФАНТОМОВ: {len(battery)} экспериментов")
+        print("=" * 90)
+
+        all_results = []
+        for i, item in enumerate(battery, 1):
+            label = item.get('label', f'phantom_{i}')
+            image = item['image']
+            measurement = item['measurement']
+            metadata = item.get('metadata', {})
+            print(f"\n{'=' * 50}")
+            print(f"[{i}/{len(battery)}] Эксперимент: {label}")
+            print(f"{'=' * 50}")
+            result = self.compare_all_methods_on_image(
+                image, measurement, label=label, metadata=metadata,
+            )
+            all_results.append(result)
+
+        self.results = all_results
+        return all_results
+
     def print_summary_table(self):
         """Вывод сводной таблицы результатов"""
         if not self.results:
@@ -958,16 +1036,18 @@ class MPIReconstructionComparator:
         print("СВОДНАЯ ТАБЛИЦА РЕЗУЛЬТАТОВ")
         print("=" * 120)
 
-        header = f"{'Расст.':<8} {'Метод':<15} {'Источник':<35} {'SSIM':<8} {'PSNR':<10} {'FWHM':<8} {'Время':<8}"
+        header = (f"{'Фантом':<32} {'Метод':<18} {'SSIM':<8} "
+                  f"{'PSNR':<10} {'FWHM':<8} {'Время':<8}")
         print(header)
         print("-" * 120)
 
         for result in self.results:
-            distance = result['distance']
+            label = result.get('label') or (
+                f"r={result.get('radius')},d={result.get('distance')}"
+                if 'radius' in result else 'unnamed')
             for name, data in result['results'].items():
                 m = data['metrics']
-                source = data.get('source', '')
-                print(f"{distance:<8.3f} {name:<15} {source:<35} {m['ssim']:<8.4f} "
+                print(f"{label:<32} {name:<18} {m['ssim']:<8.4f} "
                       f"{m['psnr']:<10.2f} {m['fwhm']:<8.2f} {m['time']:<8.4f}")
 
         # Статистика
@@ -1022,16 +1102,20 @@ class MPIReconstructionComparator:
             f.write("\n" + "=" * 120 + "\n\n")
 
             for result in self.results:
-                distance = result['distance']
-                f.write(f"ЭКСПЕРИМЕНТ: radius={result['radius']}, distance={distance}\n")
+                label = result.get('label') or (
+                    f"radius={result.get('radius')}, distance={result.get('distance')}"
+                    if 'radius' in result else 'unnamed')
+                f.write(f"ЭКСПЕРИМЕНТ: {label}\n")
                 f.write("-" * 90 + "\n")
-                f.write(f"{'Метод':<15} {'Источник':<35} {'SSIM':<8} {'PSNR (дБ)':<12} {'FWHM':<8} {'Время (с)':<10}\n")
+                f.write(f"{'Метод':<18} {'Источник':<35} {'SSIM':<8} "
+                        f"{'PSNR (дБ)':<12} {'FWHM':<8} {'Время (с)':<10}\n")
                 f.write("-" * 90 + "\n")
 
                 for name, data in result['results'].items():
                     m = data['metrics']
                     source = data.get('source', '')
-                    f.write(f"{name:<15} {source:<35} {m['ssim']:<8.4f} {m['psnr']:<12.2f} "
+                    f.write(f"{name:<18} {source:<35} {m['ssim']:<8.4f} "
+                            f"{m['psnr']:<12.2f} "
                             f"{m['fwhm']:<8.2f} {m['time']:<10.4f}\n")
                 f.write("\n")
 

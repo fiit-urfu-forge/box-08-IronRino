@@ -14,25 +14,35 @@ from src.pipeline import run_pipeline  # noqa: E402
 
 
 if __name__ == '__main__':
-    # Параметры запуска (минимальные — для отладки)
-    NUM_SAMPLES = 200       # размер синтетического обучающего датасета
-    TRAIN_MODELS = True     # False — загружать сохранённые веса
-    PMCNET_ITER = 50        # итераций оптимизации на одно измерение
+    # Параметры запуска
+    NUM_SAMPLES = 1000          # размер синтетического обучающего датасета
+    TRAIN_MODELS = True         # False — загружать сохранённые веса
+    PMCNET_ITER = 500           # итераций оптимизации на одно измерение
+
+    # Валидация на OpenMPIData (https://github.com/MagneticParticleImaging/OpenMPIData.jl)
+    # ВЫКЛЮЧЕНА по умолчанию. Чтобы включить — поставьте True. Данные
+    # должны лежать в `mpi/ChineseData/OpenMPIData/` со структурой:
+    #     calibrations/   ← *.mdf (системные функции)
+    #     measurements/   ← подпапки backgroundDrift/, concentrationPhantom/,
+    #                        resolutionPhantom/, rotationPhantom/, shapePhantom/
+    #                        внутри каждой *.mdf
+    VALIDATE_OPENMPI = False
 
     results = run_pipeline(
         num_samples=NUM_SAMPLES,
         train_models=TRAIN_MODELS,
         pmcnet_iterations=PMCNET_ITER,
+        validate_openmpi=VALIDATE_OPENMPI,
     )
 
     synth = results.get('synthetic') if isinstance(results, dict) else results
     if synth:
         print("\n" + "=" * 70)
-        print("ИТОГОВЫЕ РЕЗУЛЬТАТЫ (синтетика, двух-капельные фантомы):")
+        print("ИТОГОВЫЕ РЕЗУЛЬТАТЫ (батарея фантомов × методов):")
         print("=" * 70)
         for result in synth:
-            distance = result['distance']
-            print(f"\nРасстояние: {distance:.3f}")
+            label = result.get('label', 'unnamed')
+            print(f"\n[{label}]")
             for name, data in result['results'].items():
                 m = data['metrics']
                 print(f"  {name:<22} SSIM={m['ssim']:.4f}  "
