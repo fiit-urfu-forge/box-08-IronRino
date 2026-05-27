@@ -299,13 +299,15 @@ class DEQMPI(nn.Module):
             История loss по эпохам.
         """
         from torch.utils.data import DataLoader, TensorDataset
+        from tqdm import tqdm
         dev = next(self.parameters()).device
         ds = TensorDataset(x_train)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
         opt = torch.optim.Adam(self.rdn.parameters(), lr=lr)
         crit = nn.L1Loss()
         history = []
-        for ep in range(epochs):
+        pbar = tqdm(range(epochs), desc='      DEQ-pretrain RDN', leave=False)
+        for ep in pbar:
             total = 0.0
             for (xb,) in loader:
                 xb = xb.to(dev)
@@ -316,7 +318,9 @@ class DEQMPI(nn.Module):
                 loss.backward()
                 opt.step()
                 total += loss.item()
-            history.append(total / max(1, len(loader)))
+            avg = total / max(1, len(loader))
+            history.append(avg)
+            pbar.set_postfix({'loss': f'{avg:.4f}'})
         return history
 
     def pretrain_lc(self, y_clean: torch.Tensor, sigma2: float = 0.05,
@@ -332,13 +336,15 @@ class DEQMPI(nn.Module):
             y_clean: (N, M) — чистые training-измерения (без шума).
         """
         from torch.utils.data import DataLoader, TensorDataset
+        from tqdm import tqdm
         dev = next(self.parameters()).device
         ds = TensorDataset(y_clean)
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
         opt = torch.optim.Adam(self.lc.parameters(), lr=lr)
         crit = nn.L1Loss()
         history = []
-        for ep in range(epochs):
+        pbar = tqdm(range(epochs), desc='      DEQ-pretrain LC', leave=False)
+        for ep in pbar:
             total = 0.0
             for (yb,) in loader:
                 yb = yb.to(dev)
@@ -358,7 +364,9 @@ class DEQMPI(nn.Module):
                 loss.backward()
                 opt.step()
                 total += loss.item()
-            history.append(total / max(1, len(loader)))
+            avg = total / max(1, len(loader))
+            history.append(avg)
+            pbar.set_postfix({'loss': f'{avg:.4f}'})
         return history
 
 

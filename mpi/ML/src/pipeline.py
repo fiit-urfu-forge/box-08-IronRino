@@ -39,7 +39,8 @@ from .data.phantoms import PhantomType
 from .models import (
     ChaeSingleLayerNN, ChaeMultiLayerNN,
     DeepImagePrior, ShangCNN, DEQMPI,
-    PMCNetConfig, PMCNetStandard, PMCNetPhysicsEnhanced, PMCNetFinal,
+    PMCNetConfig, PMCNetStandard, PMCNetPaper,
+    PMCNetPhysicsEnhanced, PMCNetFinal,
     MoEReconstructor,
     build_analytical_system_matrix,
 )
@@ -448,7 +449,8 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
     from .models.classical import TikhonovReconstructor
     tik = TikhonovReconstructor(SM)
     inputs = []
-    for m in X_train:
+    for m in tqdm(X_train, desc='    Shang: prep Tikhonov inputs',
+                  leave=False):
         v = np.concatenate([m[0], m[1]])
         recon = tik.reconstruct(v, mu=1e-2, kmax=15).reshape(*y_train.shape[1:])
         inputs.append(recon)
@@ -508,10 +510,11 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
     print(f"    [init 2/2] Pre-train LC как L2-проекция ({pretrain_eps} эп., σ₂=0.05, σ₃=0.02)...")
     # Чистые измерения y_clean = SM @ y_train (без шума)
     y_clean = np.zeros_like(X_real)
-    for i in range(len(y_img)):
+    A_np = model.A.cpu().numpy()
+    for i in tqdm(range(len(y_img)), desc='    DEQ: prep y_clean = SM·c',
+                  leave=False):
         c = y_img[i, 0].flatten()
-        u_re = model.A.cpu().numpy() @ c
-        y_clean[i] = u_re
+        y_clean[i] = A_np @ c
     model.pretrain_lc(torch.tensor(y_clean), sigma2=0.05, sigma3=0.02,
                       epochs=pretrain_eps, lr=1e-3, batch_size=8)
 
@@ -545,10 +548,19 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
 
 # --- PMCNet trio (data-free) -----------------------------------------------
 
-def build_pmcnet_trio(SM, image_shape,
-                      n_iterations: int = 1500, n_colors: int = 2,
-                      init_tau_seconds: float = 2.0e-6):
-    print("\n  PMCNet (Huang 2026) — три варианта (data-free)...")
+def build_pmcnet_quartet(SM, image_shape,
+                          n_iterations: int = 1500, n_colors: int = 2,
+                          init_tau_seconds: float = 2.0e-6):
+    """Собрать четыре варианта PMCNet (data-free, paper Sec. III.B).
+
+    Returns:
+        (standard, paper, physics_enhanced, final)
+          standard: SM-baseline (не из paper), форвард = S_measured · c
+          paper:    paper-faithful Huang 2026 (Eq. 1-3), базовая физика
+          physics_enhanced: paper + радиальная p, центр. FD, langevin_safe
+          final:    PhysicsEnhanced + Debye + multi-color + TV
+    """
+    print("\n  PMCNet (Huang 2026) — четыре варианта (data-free)...")
     base = PMCNetConfig(
         image_size=tuple(image_shape),
         n_iterations=n_iterations,
@@ -556,6 +568,7 @@ def build_pmcnet_trio(SM, image_shape,
     )
     n_meas = int(SM.shape[0])
     standard = PMCNetStandard(SM, image_shape, config=base)
+    paper = PMCNetPaper(image_shape, n_meas, config=base)
     phys = PMCNetPhysicsEnhanced(image_shape, n_meas, config=base)
     final_cfg = PMCNetConfig(**{
         **base.__dict__,
@@ -564,10 +577,25 @@ def build_pmcnet_trio(SM, image_shape,
     })
     final = PMCNetFinal(image_shape, n_meas,
                         config=final_cfg, n_colors=n_colors)
-    print(f"    1) Standard          (S из калибровки сканера)")
-    print(f"    2) Physics-Enhanced  (hard-constraint форвард, PCNN-стиль)")
-    print(f"    3) Final             (hard-constraint + Debye + multi-color + TV)")
-    return standard, phys, final
+    print(f"    1) Standard          (SM-baseline — НЕ из paper)")
+    print(f"    2) Paper             (paper-faithful, Huang 2026 Eq. 1-3)")
+    print(f"    3) Physics-Enhanced  (paper + радиальная p, центр. FD, ...)")
+    print(f"    4) Final             (PhysicsEnhanced + Debye + multi-color + TV)")
+    return standard, paper, phys, final
+
+
+# Legacy alias — старый код, который вызывает build_pmcnet_trio
+def build_pmcnet_trio(SM, image_shape, n_iterations: int = 1500,
+                       n_colors: int = 2, init_tau_seconds: float = 2.0e-6):
+    """[legacy] Возвращает (standard, physics_enhanced, final) без Paper.
+
+    Сохранено для обратной совместимости; новый код должен использовать
+    `build_pmcnet_quartet`.
+    """
+    std, _paper, phys, fin = build_pmcnet_quartet(
+        SM, image_shape, n_iterations, n_colors, init_tau_seconds
+    )
+    return std, phys, fin
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +871,7 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     dip = build_dip(image_shape)
     shang = train_or_load_shang(X_train, y_train, SM, train=train_models)
     deq = train_or_load_deq(SM, image_shape, X_train, y_train, train=train_models)
-    pmcnet_std, pmcnet_phys, pmcnet_final = build_pmcnet_trio(
+    pmcnet_std, pmcnet_paper, pmcnet_phys, pmcnet_final = build_pmcnet_quartet(
         SM, image_shape, n_iterations=pmcnet_iterations, n_colors=2,
     )
 
@@ -858,6 +886,7 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     cmp.set_shang_model(shang)
     cmp.set_deq_model(deq)
     cmp.set_pmcnet_standard(pmcnet_std)
+    cmp.set_pmcnet_paper(pmcnet_paper)
     cmp.set_pmcnet_physics_enhanced(pmcnet_phys)
     cmp.set_pmcnet_final(pmcnet_final)
 

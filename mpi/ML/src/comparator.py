@@ -38,9 +38,10 @@ class MPIReconstructionComparator:
         # PMCNet (Huang et al., 2026) — три варианта в одной системе координат
         self.pmcnet_reconstructor = None              # legacy alias for Standard
         self.pmcnet_refined_reconstructor = None       # legacy alias for Final
-        self.pmcnet_standard = None                    # 1) измеренная SM
-        self.pmcnet_physics_enhanced = None            # 2) аналитическая SM
-        self.pmcnet_final = None                       # 3) аналитическая SM + Debye + multi-color + TV
+        self.pmcnet_standard = None                    # 1) измеренная SM (baseline)
+        self.pmcnet_paper = None                       # 2) paper-faithful (Huang 2026 Eq. 1-3)
+        self.pmcnet_physics_enhanced = None            # 3) paper + physical улучшения
+        self.pmcnet_final = None                       # 4) PhysicsEnhanced + Debye + multi-color + TV
 
         # Mixture of Experts поверх остальных методов
         self.moe = None
@@ -124,29 +125,39 @@ class MPIReconstructionComparator:
             self.pmcnet_final = pmcnet_refined_reconstructor
 
     def set_pmcnet_standard(self, reconstructor):
-        """Установить вариант 1: PMCNet-Standard (Huang et al., 2026).
+        """Вариант 1 — PMCNet-Standard (SM-baseline, _не_ из paper).
 
         Прямой оператор — ИЗМЕРЕННАЯ системная матрица из калибровки
-        сканера. Никаких физических/NN-улучшений.
+        сканера (S·c). Сохраняется как независимый baseline параллельно
+        с paper-faithful PMCNet, чтобы видеть метрики обоих подходов.
         """
         self.pmcnet_standard = reconstructor
 
-    def set_pmcnet_physics_enhanced(self, reconstructor):
-        """Установить вариант 2: PMCNet-Physics-Enhanced.
+    def set_pmcnet_paper(self, reconstructor):
+        """Вариант 2 — PMCNet-Paper (paper-faithful, Huang 2026 Eq. 1-3).
 
-        Прямой оператор — АНАЛИТИЧЕСКАЯ системная матрица (стабильный
-        Langevin, радиальная s(r), Лиссажу, центральная разность через
-        фиксированную свёртку). NN не трогаем — single color, без Дебая,
-        без TV.
+        Прямой оператор — `BasicAnalyticalForwardModel` (paper-faithful
+        Langevin adiabatic, p(r) ≡ 1, forward-FD для ∂/∂t, без Debye).
+        Соответствует pseudocode Алгоритма 1 статьи: φ_θ(z) → ĉ, P(ĉ)
+        через явную физику, loss = L1.
+        """
+        self.pmcnet_paper = reconstructor
+
+    def set_pmcnet_physics_enhanced(self, reconstructor):
+        """Вариант 3 — PMCNet-PhysicsEnhanced (paper-base + physical улучшения).
+
+        База — paper-faithful, поверх неё: радиальная p(r), стабильный
+        Langevin, центральная разность через Conv1d (в духе Maxwell-PCNN).
+        Без NN-довесков — single color, без Дебая, без TV.
         """
         self.pmcnet_physics_enhanced = reconstructor
 
     def set_pmcnet_final(self, reconstructor):
-        """Установить вариант 3: PMCNet-Final.
+        """Вариант 4 — PMCNet-Final (PhysicsEnhanced + Debye + multi-color + TV).
 
-        Аналитическая SM (как в Physics-Enhanced) + полный набор NN-
-        оптимизаций: релаксация Дебая с обучаемой τ_k, multi-color,
-        TV-регуляризация, hard constraints by construction.
+        Самая полная версия: physics improvements + paper Eq. 4-5 (Debye)
+        + paper Sec. III (multi-color, обучаемая τ_k через softplus)
+        + TV-регуляризация (наше).
         """
         self.pmcnet_final = reconstructor
 
@@ -431,7 +442,7 @@ class MPIReconstructionComparator:
 
     # -- Вариант 1: PMCNet-Standard (измеренная SM) ---------------------------
     def pmcnet_standard_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-Standard: u = S_measured · c, L1, без улучшений."""
+        """PMCNet-Standard: u = S_measured · c, L1, _не_ из paper."""
         if self.pmcnet_standard is None:
             raise ValueError("PMCNet-Standard модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
@@ -440,7 +451,25 @@ class MPIReconstructionComparator:
         )
         return self._postprocess_recon(recon)
 
-    # -- Вариант 2: PMCNet-Physics-Enhanced (аналитическая SM) ----------------
+    # -- Вариант 2: PMCNet-Paper (paper-faithful, Huang 2026 Eq. 1-3) ---------
+    def pmcnet_paper_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-Paper: u = BasicAnalyticalForward(c), без улучшений.
+
+        Прямой оператор реализует ровно Eq. 1-3 статьи: Langevin
+        adiabatic, p(r) ≡ 1, ∂/∂t через forward-difference. Loss = L1.
+        Идеально работает на u_meas, сгенерированных через ту же
+        аналитическую физику (paper Sec. III.A: "u_meas and u use the
+        same physical model for calculation").
+        """
+        if self.pmcnet_paper is None:
+            raise ValueError("PMCNet-Paper модель не установлена")
+        u_complex = self._measurement_to_complex_vector(measurement)
+        recon = self.pmcnet_paper.reconstruct(
+            u_complex, n_iterations=n_iterations, verbose=False,
+        )
+        return self._postprocess_recon(recon)
+
+    # -- Вариант 3: PMCNet-Physics-Enhanced (paper + physical улучшения) ------
     def pmcnet_physics_enhanced_reconstruction(self, measurement, n_iterations=None):
         """PMCNet-Physics-Enhanced: u = S_analytical · c, без NN-улучшений.
 
@@ -901,13 +930,16 @@ class MPIReconstructionComparator:
             ('DEQ-MPI(2024)', self.deq_reconstruction if self.deq_model else None, "Güngör et al. - DEQ-MPI"),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
-             "Huang et al. - Standard (измеренная SM)"),
+             "Huang et al. - SM-baseline (измеренная SM)"),
+            ('PMCNet-Paper(2026)',
+             self.pmcnet_paper_reconstruction if self.pmcnet_paper else None,
+             "Huang et al. - paper-faithful (явная физика)"),
             ('PMCNet-Phys(2026)',
              self.pmcnet_physics_enhanced_reconstruction if self.pmcnet_physics_enhanced else None,
-             "Huang et al. - +улучшенная физика (аналитическая SM)"),
+             "Huang et al. - +радиальная p, центр. FD, langevin_safe"),
             ('PMCNet-Final(2026)',
              self.pmcnet_final_reconstruction if self.pmcnet_final else None,
-             "Huang et al. - +Debye+multi-color+TV (физика+NN)"),
+             "Huang et al. - +Debye+multi-color+TV"),
             ('CNN', self.cnn_reconstruction if self.cnn_trainer else None, "CNN (UNet)"),
             ('MoDL', self.modl_reconstruction if self.modl_trainer else None, "MoDL Network"),
             ('Diffusion', self.diffusion_reconstruction if self.diffusion_trainer else None, "Diffusion Model"),

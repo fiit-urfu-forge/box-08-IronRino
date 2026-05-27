@@ -345,6 +345,32 @@ class RadialCoilSensitivity(nn.Module):
         return self.sensitivity
 
 
+class UniformCoilSensitivity(nn.Module):
+    """p(r) ≡ 1 — paper-faithful профиль чувствительности катушки.
+
+    Статья Huang 2026 (Sec. II.B, Eq. 1) определяет u(t) через интеграл
+    с произвольным `p(r)`, но в симуляциях статьи (Sec. III.A) явный вид
+    `p(r)` не задаётся — фактически используется константа = 1 (идеальный
+    приёмник). Это нужно отдельно от `RadialCoilSensitivity`
+    (s(r) = 1/(1+(r/R)²)) — последняя наше улучшение сверх статьи.
+
+    Используется в `BasicAnalyticalForwardModel` (paper-faithful PMCNet).
+    """
+
+    def __init__(self, image_size: Tuple[int, int], image_extent_m: float):
+        super().__init__()
+        Nx, Ny = image_size
+        x = torch.linspace(-image_extent_m / 2.0, image_extent_m / 2.0, Nx)
+        y = torch.linspace(-image_extent_m / 2.0, image_extent_m / 2.0, Ny)
+        X, Y = torch.meshgrid(x, y, indexing='ij')
+        self.register_buffer('sensitivity', torch.ones_like(X))
+        self.register_buffer('X', X)
+        self.register_buffer('Y', Y)
+
+    def forward(self) -> torch.Tensor:
+        return self.sensitivity
+
+
 class LissajousFFPTrajectory(nn.Module):
     """Траектория FFP в виде фигуры Лиссажу.
 
@@ -424,6 +450,34 @@ class TimeDerivativeFD(nn.Module):
         T = orig_shape[-1]
         V_flat = V.reshape(-1, 1, T)
         V_pad = F.pad(V_flat, (1, 1), mode='replicate')
+        dV = F.conv1d(V_pad, self.kernel)
+        return dV.view(orig_shape)
+
+
+class TimeDerivativeForwardFD(nn.Module):
+    """∂/∂t через forward-difference: ∂V/∂t[k] ≈ (V[k+1] − V[k]) / Δt.
+
+    Реализует буквально theory.md Eq. derivative — простейшую схему,
+    к которой по умолчанию приходит paper-PMCNet (статья не специфицирует
+    схему дискретизации). Точность O(Δt), на единицу хуже центральной
+    разности из `TimeDerivativeFD` (O(Δt²)) — но соответствует
+    paper-faithful базовой версии.
+
+    Реплицирующее padding в конце сохраняет длину T.
+    """
+
+    def __init__(self, dt: float):
+        super().__init__()
+        kernel = torch.tensor([-1.0, 1.0], dtype=torch.float32) / float(dt)
+        self.register_buffer('kernel', kernel.view(1, 1, 2))
+
+    def forward(self, V: torch.Tensor) -> torch.Tensor:
+        """V: (..., T) → ∂V/∂t той же формы (forward FD, O(Δt))."""
+        orig_shape = V.shape
+        T = orig_shape[-1]
+        V_flat = V.reshape(-1, 1, T)
+        # Реплицируем последний элемент справа, чтобы выход имел длину T
+        V_pad = F.pad(V_flat, (0, 1), mode='replicate')
         dV = F.conv1d(V_pad, self.kernel)
         return dV.view(orig_shape)
 
@@ -561,6 +615,100 @@ class AnalyticalForwardModel(nn.Module):
         return torch.stack([u_x, u_y], dim=1)              # (B, 2, T)
 
 
+class BasicAnalyticalForwardModel(nn.Module):
+    """Paper-faithful PMCNet прямой оператор (Huang 2026, Sec. II.B, Eq. 1–3).
+
+    Реализует ровно те уравнения, что описаны в статье, без улучшений:
+
+        u(t) = −μ₀ ∫ c(r) · p(r) · ∂M(r,t)/∂t dr            [paper Eq. 1]
+        M(r,t) = c · m · (coth(αH) − 1/(αH)) · ê_H           [paper Eq. 2]
+        α = μ₀·m / (k_B·T)                                   [paper Eq. 3]
+
+    Отличия от `AnalyticalForwardModel` (наша улучшенная версия):
+      • p(r) ≡ 1 (`UniformCoilSensitivity`) — статья не специфицирует
+        профиль; радиальная p(r) = 1/(1+(r/R)²) — наше улучшение.
+      • ∂/∂t через forward-difference (`TimeDerivativeForwardFD`) — это
+        theory.md Eq. derivative буквально, как в paper. Центральная
+        разность через Conv1d — наше улучшение (см. `TimeDerivativeFD`,
+        в духе Maxwell-PCNN Eq. 12–13).
+      • Без релаксации Дебая (paper Sec. II.B — adiabatic model);
+        Debye-расширение есть в `PMCNetFinal` (paper Sec. II.C).
+      • Без multi-color, без TV-штрафа.
+
+    `langevin_safe` используется даже в базовой версии: без него float32
+    даёт NaN при ξ → 0 (катастрофическое сокращение в `coth(ξ) − 1/ξ`).
+    Это численная необходимость для PyTorch-реализации, не отход от
+    статьи (в paper рассматривается математическая форма, без обсуждения
+    численной устойчивости float32).
+    """
+
+    def __init__(self, config: 'PMCNetConfig'):
+        super().__init__()
+        self.config = config
+        self.coil = UniformCoilSensitivity(
+            image_size=config.image_size,
+            image_extent_m=config.image_extent_m,
+        )
+        amp_x_m = config.drive_field_amplitude / config.gradient_strength
+        amp_y_m = (config.drive_field_amplitude_y /
+                   config.gradient_strength_y)
+        self.ffp = LissajousFFPTrajectory(
+            n_time_samples=config.n_time_samples,
+            freq_x_hz=config.drive_frequency_x,
+            freq_y_hz=config.drive_frequency_y,
+            amp_x_m=amp_x_m,
+            amp_y_m=amp_y_m,
+            duration_s=config.scan_duration_s,
+        )
+        self.langevin = LangevinMagnetization(
+            saturation_magnetization_T=config.saturation_magnetization_T,
+            particle_diameter_nm=config.particle_diameter_nm,
+            temperature_K=config.temperature_K,
+        )
+        # Forward FD — paper-faithful схема дискретизации производной
+        self.ddt = TimeDerivativeForwardFD(dt=float(self.ffp.dt.item()))
+        self.register_buffer('gradient_x',
+                              torch.tensor(config.gradient_strength,
+                                           dtype=torch.float32))
+        self.register_buffer('gradient_y',
+                              torch.tensor(config.gradient_strength_y,
+                                           dtype=torch.float32))
+        Nx, Ny = config.image_size
+        dx = config.image_extent_m / (Nx - 1)
+        dy = config.image_extent_m / (Ny - 1)
+        self.register_buffer('dA',
+                              torch.tensor(dx * dy, dtype=torch.float32))
+
+    def _compute_magnetization(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        X = self.coil.X.unsqueeze(-1)
+        Y = self.coil.Y.unsqueeze(-1)
+        r_x = self.ffp.r_x.view(1, 1, -1)
+        r_y = self.ffp.r_y.view(1, 1, -1)
+        Hx = self.gradient_x * (X - r_x)
+        Hy = self.gradient_y * (Y - r_y)
+        return self.langevin(Hx, Hy)
+
+    def forward(self, concentration: torch.Tensor) -> torch.Tensor:
+        """concentration: (B, 1, Nx, Ny) → u: (B, 2, T) [x-coil, y-coil]."""
+        if concentration.dim() == 3:
+            concentration = concentration.unsqueeze(1)
+        B = concentration.shape[0]
+
+        Mx, My = self._compute_magnetization()
+        dMx_dt = self.ddt(Mx)
+        dMy_dt = self.ddt(My)
+
+        s = self.coil.sensitivity                          # (Nx, Ny), ≡ 1
+        c = concentration[:, 0]                            # (B, Nx, Ny)
+        weight = (s.unsqueeze(0) * c).unsqueeze(-1)        # (B, Nx, Ny, 1)
+
+        scale = -self.langevin.mu0 * self.dA
+        u_x = scale * (weight * dMx_dt.unsqueeze(0)).sum(dim=(1, 2))
+        u_y = scale * (weight * dMy_dt.unsqueeze(0)).sum(dim=(1, 2))
+
+        return torch.stack([u_x, u_y], dim=1)              # (B, 2, T)
+
+
 # =============================================================================
 # Hard-constraint декомпозиция (Maxwell-PCNN-стиль, Scheinker 2023)
 # =============================================================================
@@ -681,6 +829,84 @@ class HardConstrainedSpectralForward(nn.Module):
             U_x[:, :self.n_freq_per_coil],
             U_y[:, :self.n_freq_per_coil],
         ], dim=-1) / self.output_scale                          # (B, M) complex
+        return U.real, U.imag
+
+
+class BasicHardConstrainedSpectralForward(nn.Module):
+    """Paper-faithful версия `HardConstrainedSpectralForward`.
+
+    Полностью повторяет интерфейс «улучшенного» спектрального форварда
+    (`c_flat → (u_real, u_imag)` в формате measurement), но внутри
+    использует `BasicAnalyticalForwardModel` — paper-faithful физику
+    без радиальной p(r), без центральной FD, без Debye.
+
+    FFT и нормировка по `output_scale` идентичны улучшенной версии:
+    это нужно, чтобы PMCNetPaper мог использовать ту же loss-функцию
+    и тот же measurement-формат, что и остальные PMCNet-варианты.
+    """
+
+    def __init__(self, config: 'PMCNetConfig', n_meas_bins: int):
+        super().__init__()
+        if n_meas_bins % 2 != 0:
+            raise ValueError(
+                f"n_meas_bins ({n_meas_bins}) должно быть чётным "
+                f"(по половине на каждую катушку)"
+            )
+        self.n_meas_bins = int(n_meas_bins)
+        self.n_freq_per_coil = self.n_meas_bins // 2
+
+        cfg = config
+        if cfg.n_time_samples < 2 * self.n_freq_per_coil:
+            cfg = PMCNetConfig(**{
+                **config.__dict__,
+                'n_time_samples': 2 * self.n_freq_per_coil,
+            })
+        self._Nx, self._Ny = cfg.image_size
+
+        # Paper-faithful физика: BasicAnalyticalForwardModel
+        self.physics = BasicAnalyticalForwardModel(cfg)
+
+        with torch.no_grad():
+            Mx, My = self.physics._compute_magnetization()
+            dMx = self.physics.ddt(Mx)
+            dMy = self.physics.ddt(My)
+            s = self.physics.coil.sensitivity                  # ≡ 1
+            scale = -self.physics.langevin.mu0 * self.physics.dA
+            kx = scale * s.unsqueeze(-1) * dMx
+            ky = scale * s.unsqueeze(-1) * dMy
+            T = kx.shape[-1]
+            Kx_freq = torch.fft.rfft(kx.reshape(-1, T), dim=-1)
+            Ky_freq = torch.fft.rfft(ky.reshape(-1, T), dim=-1)
+            sm_max = torch.cat([
+                Kx_freq[:, :self.n_freq_per_coil].abs().flatten(),
+                Ky_freq[:, :self.n_freq_per_coil].abs().flatten(),
+            ]).max().clamp_min(1e-30)
+        self.register_buffer('output_scale', sm_max)
+
+    @property
+    def M(self) -> int:
+        return self.n_meas_bins
+
+    @property
+    def N(self) -> int:
+        return self._Nx * self._Ny
+
+    def forward(self, c_flat: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = c_flat.shape[0]
+        if c_flat.shape[1] != self._Nx * self._Ny:
+            raise ValueError(
+                f"c_flat имеет {c_flat.shape[1]} пикселей, "
+                f"ожидалось {self._Nx * self._Ny}"
+            )
+        c_img = c_flat.view(B, 1, self._Nx, self._Ny)
+        u_time = self.physics(c_img)                           # (B, 2, T)
+        U_x = torch.fft.rfft(u_time[:, 0], dim=-1)
+        U_y = torch.fft.rfft(u_time[:, 1], dim=-1)
+        U = torch.cat([
+            U_x[:, :self.n_freq_per_coil],
+            U_y[:, :self.n_freq_per_coil],
+        ], dim=-1) / self.output_scale
         return U.real, U.imag
 
 
@@ -883,6 +1109,54 @@ class PMCNetWithRefinedPhysics(nn.Module):
             u_imag_total = u_imag_total + u_i
 
         return c, u_real_total, u_imag_total
+
+
+# =============================================================================
+# Paper-faithful PMCNet (Huang 2026, Sec. II.B + III.B)
+# =============================================================================
+
+
+class PMCNetWithBasicPhysics(nn.Module):
+    """PMCNet строго по статье Huang 2026 (без улучшений).
+
+    Архитектура: U-Net φ_θ(z) → концентрация c, физический форвард по
+    Eq. 1–3 статьи (paper Sec. II.B) через `BasicAnalyticalForwardModel`:
+
+      Шаг 1. Lissajous-траектория FFP по заданным f_x, f_y, A_x, A_y, G.
+      Шаг 2. H_total = G·(r − r_FFP(t)) [paper Eq. (без номера в III.A)].
+      Шаг 3. M(H) = m·L(α·|H|)·ê_H через Langevin (paper Eq. 2, 3).
+      Шаг 4. ∂M/∂t через forward-difference (paper Eq. derivative).
+      Шаг 5. u(t) = −μ₀·∫ p(r)·c(r)·∂M/∂t dr,  p(r) ≡ 1 (paper Eq. 1).
+      Шаг 6. U(f) = FFT_t{u(t)} для совместимости с pipeline-форматом
+                    measurement.
+
+    Что НЕ входит (это сделано в улучшенных моделях):
+      • Радиальная p(r) = 1/(1+(r/R)²) — `PMCNetPhysicsEnhanced`.
+      • Центральная конечная разность через Conv1d — `PMCNetPhysicsEnhanced`.
+      • Релаксация Дебая (paper Sec. II.C) — `PMCNetFinal`.
+      • Multi-color (paper Sec. III) — `PMCNetFinal`.
+      • TV-регуляризация — `PMCNetFinal`.
+
+    Соответствует pseudocode в задании пользователя.
+    """
+
+    def __init__(self, image_shape: Tuple[int, int],
+                 n_meas_bins: int,
+                 config: 'PMCNetConfig'):
+        super().__init__()
+        self.image_shape = tuple(image_shape)
+        self.unet = PMCNetUNet(image_size=self.image_shape, out_channels=1,
+                               base=config.base_channels)
+        self.forward_op = BasicHardConstrainedSpectralForward(
+            config, n_meas_bins
+        )
+
+    def forward(self, z: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c = self.unet(z)
+        c_flat = c.view(c.shape[0], -1)
+        u_real, u_imag = self.forward_op(c_flat)
+        return c, u_real, u_imag
 
 
 # =============================================================================
@@ -1157,6 +1431,72 @@ class PMCNetRefinedReconstructor(_BaseReconstructor):
         if self.config.n_colors == 1:
             c_np = c_np[0]
         return c_np, taus
+
+
+class PMCNetPaperReconstructor(_BaseReconstructor):
+    """Реконструктор для `PMCNetPaper` — алгоритм 1 статьи в чистом виде.
+
+    Совпадает с pseudocode пользователя:
+
+        Init θ ~ random, z ~ N(0, 1) (зафиксирован seed-ом).
+        For iter = 1 .. n_iterations:
+            ĉ = φ_θ(z)
+            û = P(ĉ)                                # paper Eq. 1–3
+            L = ‖û − u_meas‖₁                       # paper Eq. 7, 8
+            backward, Adam.step()                   # lr = 1e-3
+        return ĉ
+
+    По умолчанию `n_iterations = 20000`, `lr = 1e-3`, Adam (paper Sec. III.B).
+    """
+
+    def __init__(self, image_shape: Tuple[int, int], n_meas_bins: int,
+                 config: Optional[PMCNetConfig] = None):
+        cfg = config or PMCNetConfig(image_size=tuple(image_shape))
+        cfg = PMCNetConfig(**{**cfg.__dict__,
+                              'image_size': tuple(image_shape)})
+        net = PMCNetWithBasicPhysics(image_shape, n_meas_bins, cfg)
+        super().__init__(net, cfg)
+        self.image_shape = tuple(image_shape)
+
+    def reconstruct(self, measurement, n_iterations: Optional[int] = None,
+                    verbose: bool = False, reset: bool = True) -> np.ndarray:
+        n_iter = n_iterations or self.config.n_iterations
+        u_real, u_imag = self._measurement_to_tensors(measurement)
+        M = self.network.forward_op.M
+        if u_real.numel() != M:
+            raise ValueError(
+                f"Измерение содержит {u_real.numel()} бинов, ожидалось {M}."
+            )
+
+        if reset:
+            self._reset_unet_weights()
+
+        torch.manual_seed(self.config.seed)
+        z = torch.randn(1, 1, *self.image_shape, device=self.device)
+
+        optimizer = torch.optim.Adam(self.network.parameters(),
+                                     lr=self.config.learning_rate)
+        self.loss_history.clear()
+
+        iterator = range(n_iter)
+        if verbose:
+            iterator = tqdm(iterator, desc='PMCNet-Paper')
+
+        for it in iterator:
+            optimizer.zero_grad()
+            c, ur, ui = self.network(z)
+            loss = (ur[0] - u_real).abs().mean() + (ui[0] - u_imag).abs().mean()
+            loss.backward()
+            optimizer.step()
+            self.loss_history.append(loss.item())
+            if verbose and (it % max(1, n_iter // 20) == 0):
+                iterator.set_postfix({'loss': f'{loss.item():.4e}'})
+
+        self.network.eval()
+        with torch.no_grad():
+            c, _, _ = self.network(z)
+        self.network.train()
+        return c[0, 0].detach().cpu().numpy()
 
 
 class PMCNetHardConstrainedReconstructor(_BaseReconstructor):
@@ -1585,49 +1925,87 @@ def build_analytical_system_matrix(image_shape: Tuple[int, int],
 
 
 class PMCNetStandard(PMCNetReconstructor):
-    """PMCNet в исходной форме статьи Huang et al. (2026) для нашего пайплайна.
+    """PMCNet-baseline: φ_θ(z) → c → S·c, где S — _измеренная_ SM сканера.
 
-    Прямой оператор: ИЗМЕРЕННАЯ системная матрица сканера
-    (BeihangUniversityData / OpenMPI). Loss = L1, оптимизатор — Adam.
-    Никаких физических или NN-улучшений сверх того, что описано в
-    Sec. II–III статьи. Эта вариация — точка отсчёта для сравнения.
+    Это _не_ paper-faithful версия. В статье Huang 2026 (Sec. I, IV)
+    PMCNet специально позиционируется как метод _без_ системной матрицы:
+        "without the need for a system matrix and network training"
+        "without the laborious system matrix calibration"
+    SM-метод в статье — это _baseline_ для сравнения, а не сам PMCNet.
+    Paper-faithful версия — это `PMCNetPaper` (см. ниже).
+
+    Эта модель в нашем пайплайне сохраняется как _независимый baseline_,
+    чтобы параллельно с paper-faithful PMCNet видеть метрики SM-подхода
+    на тех же фантомах. Прямой оператор — `S_measured · c` через
+    `SystemMatrixForward`, loss = L1, оптимизатор — Adam.
+    """
+
+
+class PMCNetPaper(PMCNetPaperReconstructor):
+    """Paper-faithful PMCNet — точно по статье Huang 2026.
+
+    Прямой оператор: `BasicAnalyticalForwardModel` (paper Eq. 1–3):
+      • Lissajous-траектория FFP по f_x, f_y, A_x/G_x, A_y/G_y;
+      • H_total(r,t) = G·(r − r_FFP(t));
+      • Langevin (адиабатический, без релаксации Дебая);
+      • p(r) ≡ 1 (uniform — paper не специфицирует профиль катушки);
+      • ∂M/∂t через forward-difference (theory.md Eq. derivative буквально);
+      • u(t) = −μ₀·∫ p(r)·c(r)·∂M/∂t dr.
+
+    Без улучшений: без радиальной p(r), без центральной FD через Conv1d,
+    без Дебая, без multi-color, без TV. Только то, что описано в paper
+    Sec. II.B + III.B.
+
+    Алгоритм (paper Sec. III.B):
+      Init: θ random, z ~ N(0,1) (фикс. seed)
+      Loop n_iterations=20000 (default):
+        ĉ = φ_θ(z); û = P(ĉ); L = ‖û − u_meas‖₁; backward; Adam.step()
+      Return ĉ
+
+    Это вариант, к которому нужно подавать _аналитически_ сгенерированный
+    u_meas (см. `synthesize_measurements_analytical` в pipeline.py) —
+    paper в симуляциях так же делает: "In the simulation, u_meas and u
+    use the same physical model for calculation" (Sec. III.A).
     """
 
 
 class PMCNetPhysicsEnhanced(PMCNetHardConstrainedReconstructor):
-    """PMCNet с улучшенной физикой: hard-constraint форвард в духе Maxwell-PCNN.
+    """PMCNet-Paper + физические улучшения (без NN-довесок).
 
-    Отличие от Standard — _как_ строится прямой оператор:
-      • Standard:        forward = S·c, где S — _измеренная_ SM из
-                         калибровки реального сканера (фиксированная
-                         линейная матрица, физика «застывшая»).
-      • PhysicsEnhanced: forward — _архитектурная_ цепочка фиксированных
-                         дифференцируемых слоёв, реализующая ровно
-                         уравнения theory.md, пересчитывается каждую
-                         итерацию (физика «живая», параметры доступны
-                         для будущего blind-calibration).
+    База — `PMCNetPaper` (paper-faithful: Eq. 1–3 статьи через
+    `BasicAnalyticalForwardModel`). Сверх неё добавлены _только_ улучшения
+    физики, не связанные с машинным обучением, в основном инспирированные
+    Maxwell-PCNN (Scheinker 2023):
 
-    Цепочка форварда (theory.md, раздел «Основное уравнение MPI»):
+      ▸ Радиальная p(r) = 1/(1+(r/R_coil)²) вместо paper-uniform p(r) ≡ 1
+        (theory.md Eq. coil_sensitivity, заменяет `UniformCoilSensitivity`
+        на `RadialCoilSensitivity`) — учитывает реальный профиль приёмной
+        катушки, который у paper-симуляций неявно идеализирован.
 
-        r_FFP(t)  = (A_E/G)·sin(2π·f·t)                  [Eq. ffp_trajectory]
-        H_sel(r)  = G·r                                  [Eq. selection_field]
-        H(r,t)    = G·(r − r_FFP(t)) + H_exc(t)          [Eq. total_field]
-        m(r,t)    = m_sat·L(μ₀·m_sat·|H|/(k_B·T)) · ê    [Eq. langevin]
-        L(ξ)      = coth(ξ) − 1/ξ                        [Eq. langevin_func]
-                    с устойчивыми ветвями ξ/3 (малые) и 1−1/ξ
-                    (большие) согласно Eq. langevin_approx
-        ∂m/∂t     ≈ (m_{k+1} − m_{k−1}) / (2Δt) через
-                    Conv1d с _фиксированным_ ядром [−1, 0, +1]/(2Δt)
-                    (Eq. derivative); идея — Scheinker 2023, Eq. 12–13
-        a(r,t)    = −μ₀·s(r)·∂m/∂t                       [Eq. system_function]
-        s(r)      = 1 / (1 + (|r|/R_coil)²)              [Eq. coil_sensitivity]
-        u(t)      = Σ_{i,j} a(x_i,y_j,t)·c(x_i,y_j)·ΔxΔy [Eq. numerical_integration]
-        U(f)      = FFT_t{u(t)}; первые M/2 гармоник на катушку.
+      ▸ Центральная конечная разность ∂/∂t через _фиксированную_ Conv1d
+        с ядром [−1, 0, +1]/(2Δt) (Maxwell-PCNN Eq. 12–13, наш
+        `TimeDerivativeFD`) вместо paper-forward-FD (`TimeDerivativeForwardFD`):
+        точность O(Δt²) против O(Δt), что критично на длинных
+        Lissajous-траекториях.
 
-    Все законы зашиты _в архитектуру_ форварда (как `B = ∇×A` в PCNN
-    Eq. 6 Scheinker 2023), а не в loss. Никаких NN-улучшений сверх
-    этого: single color, без Дебая, без TV — чтобы изолированно
-    оценить вклад «hard-constraint физики» от вклада NN-стороны.
+      ▸ Численно-устойчивый Langevin (`langevin_safe`) с 5-членным
+        Тейлором для |ξ| < 0.5 и устойчивой coth для |ξ| > 0.5. В paper
+        используется математическая `coth(ξ) − 1/ξ`, что в float32 даёт
+        NaN при ξ → 0 — наша версия закрывает этот разрыв.
+
+      ▸ Полная архитектурная цепочка (`AnalyticalForwardModel` через
+        `HardConstrainedSpectralForward`) пересчитывается _каждую_
+        итерацию — физика «живая», параметры (R_coil, m_sat, ...)
+        потенциально доступны для blind-calibration в будущем (как `A`
+        в Maxwell-PCNN, Eq. 14).
+
+    Что НЕ изменилось относительно paper-PMCNet (`PMCNetPaper`):
+      ▸ Архитектура сети (U-Net без shallow skip), вход z, loss L1, Adam.
+      ▸ Single color, без Debye (это улучшения в `PMCNetFinal`).
+      ▸ Без TV (это в `PMCNetFinal`).
+
+    Назначение варианта — изолированно оценить вклад «более точной
+    физики» при том же NN-каркасе, что и в paper-варианте.
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1645,40 +2023,40 @@ class PMCNetPhysicsEnhanced(PMCNetHardConstrainedReconstructor):
 
 
 class PMCNetFinal(PMCNetHardConstrainedRefinedReconstructor):
-    """Финальный PMCNet: hard-constraint физика + полный набор NN-оптимизаций.
+    """PMCNetPhysicsEnhanced + полный набор NN-довесок (Debye + multi-color + TV).
 
-    Поверх PhysicsEnhanced (та же архитектурная цепочка theory.md,
-    Eq. main_mpi … Eq. coil_sensitivity) добавлены NN-улучшения, прямо
-    инспирированные Maxwell-PCNN (Scheinker 2023):
+    База — `PMCNetPhysicsEnhanced` (paper-PMCNet + физические улучшения).
+    Сверх неё добавлены довески, относящиеся к NN-стороне или к
+    расширению физики из paper Sec. II.C–III:
 
-      • Релаксация Дебая (Eq. 4–5 статьи PMCNet, восходящая к
-        дифференциальной форме τ·dM_D/dt = −M_D + M, theory.md
-        раздел «Численная реализация»): применяется как частотный
-        фильтр H_τ_k(f) = 1 / (1 + j·2π·f·τ_k) к выходу форварда.
-        Каждая τ_k обучается через softplus-параметризацию
-        (положительность _by construction_, как и c через sigmoid).
+      ▸ Релаксация Дебая (paper Eq. 4–5, Sec. II.C — non-adiabatic
+        модель): применяется как частотный фильтр H_τ_k(f) = 1/(1 +
+        j·2π·f·τ_k) к выходу форварда. Каждая τ_k обучается через
+        softplus-параметризацию (положительность _by construction_,
+        как и c через sigmoid). Аналогично paper Sec. III.B: «we did
+        not provide the magnitude of the relaxation time constant
+        directly, but instead estimated it through the gradient
+        descent algorithm».
 
-      • Multi-color (K цветов МНЧ): U-Net выводит K концентраций
-        c_1, …, c_K; итоговый сигнал — сумма
+      ▸ Multi-color MPI (paper Sec. III): U-Net выводит K концентраций
+        c_1,…,c_K (по одной на тип МНЧ), итоговый сигнал —
             U(f) = Σ_k H_τ_k(f) · ForwardOp(c_k).
         Это прямой аналог декомпозиции компонент в Maxwell-PCNN
-        (Scheinker 2023, Eq. 10): каждая компонента A_k зависит только
-        от своей J_k, поэтому K скалярных подсетей компактнее одной
-        K-канальной. У нас аналогично: c_k → u_k(f) независимо.
+        (Scheinker 2023, Eq. 10).
 
-      • TV-регуляризация на c (Σ_k λ·∑|∇c_k|) для подавления шума
-        реконструкции; default λ_TV = 1e-3.
+      ▸ TV-регуляризация Σ_k λ·∑|∇c_k| для подавления шума реконструкции
+        (наше добавление, не из paper); default λ_TV = 1e-3.
 
-      • Hard constraints _by construction_ (PCNN-философия):
-            – sigmoid в head U-Net  → c ∈ [0, 1] архитектурно;
-            – softplus(raw_τ)        → τ_k > 0 архитектурно;
-            – радиальная s(r) — фиксированный буфер по
-              Eq. coil_sensitivity, не штраф в loss;
-            – ядро [−1, 0, +1]/(2Δt) для ∂/∂t — фиксированный буфер
-              по Eq. derivative, аналог W_∂x в PCNN Eq. 12–13;
-            – вся цепочка theory.md встроена в архитектуру форварда,
-              поэтому u(t) согласован с физикой MPI _by construction_
-              без штрафов в loss и без предвычисленной линейной SM.
+      ▸ Hard constraints _by construction_ (PCNN-философия Scheinker 2023):
+            – sigmoid в head U-Net → c ∈ [0, 1] архитектурно;
+            – softplus(raw_τ)       → τ_k > 0 архитектурно;
+            – радиальная s(r) (из `PhysicsEnhanced`) — фиксированный
+              буфер по theory.md Eq. coil_sensitivity, не штраф в loss;
+            – ядро [−1, 0, +1]/(2Δt) для ∂/∂t (из `PhysicsEnhanced`) —
+              фиксированный буфер, аналог W_∂x в PCNN Eq. 12–13.
+
+    Иерархия: PMCNetPaper (paper-faithful) ⊂ PhysicsEnhanced (+phys
+    improvements) ⊂ Final (+Debye, +multi-color, +TV).
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1699,7 +2077,12 @@ class PMCNetFinal(PMCNetHardConstrainedRefinedReconstructor):
 __all__ = [
     'PMCNetConfig',
     'langevin_safe',
-    # Физические модули (LaTeX + Maxwell-PCNN)
+    # Paper-faithful физические примитивы (Huang 2026, Sec. II.B)
+    'UniformCoilSensitivity',
+    'TimeDerivativeForwardFD',
+    'BasicAnalyticalForwardModel',
+    'BasicHardConstrainedSpectralForward',
+    # Улучшенные физические модули (наши добавки + Maxwell-PCNN)
     'RadialCoilSensitivity',
     'LissajousFFPTrajectory',
     'TimeDerivativeFD',
@@ -1715,16 +2098,19 @@ __all__ = [
     'PMCNet',
     'PMCNetWithRefinedPhysics',
     'PMCNetWithAnalyticalPhysics',
+    'PMCNetWithBasicPhysics',
     'PMCNetHardConstrained',
     'PMCNetHardConstrainedRefined',
     # Низкоуровневые реконструкторы
     'PMCNetReconstructor',
     'PMCNetRefinedReconstructor',
     'PMCNetAnalyticalReconstructor',
+    'PMCNetPaperReconstructor',
     'PMCNetHardConstrainedReconstructor',
     'PMCNetHardConstrainedRefinedReconstructor',
-    # Три названных варианта (pipeline-ready)
-    'PMCNetStandard',
-    'PMCNetPhysicsEnhanced',
-    'PMCNetFinal',
+    # Четыре названных варианта (pipeline-ready)
+    'PMCNetStandard',           # SM из калибровки (baseline)
+    'PMCNetPaper',              # paper-faithful (Huang 2026, Eq. 1-3)
+    'PMCNetPhysicsEnhanced',    # paper + физические улучшения
+    'PMCNetFinal',              # PhysicsEnhanced + Debye + multi-color + TV
 ]
