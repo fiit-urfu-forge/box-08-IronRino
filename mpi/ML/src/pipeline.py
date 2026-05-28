@@ -525,11 +525,16 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
 
     # КРИТИЧНО (статья Sec V.A): pre-train RDN и LC отдельно перед
     # основным обучением. Без этого PSNR падает на 7–17 dB.
+    # batch_size=4 — компромисс для GPU с 4 GB VRAM. Основной OOM-fix
+    # реализован внутри DEQMPI.forward через implicit-DEQ gradient
+    # (память O(1) по числу итераций); этот batch_size — дополнительный
+    # запас для очень тесных GPU.
+    deq_batch = 4
     pretrain_eps = max(5, epochs // 3)
     print(f"    [init 1/2] Pre-train RDN как denoiser ({pretrain_eps} эп., σ₁=0.1)...")
     y_img_t = torch.tensor(y_img)
     model.pretrain_rdn(y_img_t, sigma1=0.1, epochs=pretrain_eps, lr=1e-3,
-                       batch_size=8)
+                       batch_size=deq_batch)
     print(f"    [init 2/2] Pre-train LC как L2-проекция ({pretrain_eps} эп., σ₂=0.05, σ₃=0.02)...")
     # Чистые измерения y_clean = SM @ y_train (без шума)
     y_clean = np.zeros_like(X_real)
@@ -539,10 +544,10 @@ def train_or_load_deq(SM, image_shape, X_train, y_train,
         c = y_img[i, 0].flatten()
         y_clean[i] = A_np @ c
     model.pretrain_lc(torch.tensor(y_clean), sigma2=0.05, sigma3=0.02,
-                      epochs=pretrain_eps, lr=1e-3, batch_size=8)
+                      epochs=pretrain_eps, lr=1e-3, batch_size=deq_batch)
 
     ds = TensorDataset(torch.tensor(X_real), torch.tensor(y_img))
-    loader = DataLoader(ds, batch_size=8, shuffle=True)
+    loader = DataLoader(ds, batch_size=deq_batch, shuffle=True)
     crit = torch.nn.L1Loss()  # статья: L1 на выходе
     opt = torch.optim.Adam(model.parameters(), lr=1e-3,
                            betas=(0.9, 0.999))  # статья: Adam β=(0.9, 0.999)

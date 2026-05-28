@@ -110,6 +110,13 @@ class PMCNetConfig:
     # Регуляризаторы
     lambda_tv: float = 0.0  # вес TV-штрафа на c
 
+    # Схема дискретизации ∂M/∂t для AnalyticalForwardModel:
+    #   True  → центральная разность через Conv1d с ядром [-1, 0, +1]/(2Δt)
+    #           (точность O(Δt²); используется в PMCNetFinal)
+    #   False → forward-difference [-1, +1]/Δt (точность O(Δt); paper-faithful
+    #           схема из PMCNetPaper, наследуется PMCNetPhysicsEnhanced)
+    use_central_fd: bool = True
+
 
 # =============================================================================
 # Численно-устойчивая функция Ланжевена
@@ -560,7 +567,14 @@ class AnalyticalForwardModel(nn.Module):
             particle_diameter_nm=config.particle_diameter_nm,
             temperature_K=config.temperature_K,
         )
-        self.ddt = TimeDerivativeFD(dt=float(self.ffp.dt.item()))
+        # Схема производной выбирается через config.use_central_fd:
+        #   True  → центральная разность (Maxwell-PCNN Eq. 12–13, точнее)
+        #   False → forward-difference (paper-faithful, как в PMCNetPaper)
+        dt = float(self.ffp.dt.item())
+        if config.use_central_fd:
+            self.ddt = TimeDerivativeFD(dt=dt)
+        else:
+            self.ddt = TimeDerivativeForwardFD(dt=dt)
         self.register_buffer('gradient_x',
                              torch.tensor(config.gradient_strength,
                                           dtype=torch.float32))
@@ -1640,42 +1654,34 @@ class PMCNetPaper(PMCNetPaperReconstructor):
 
 
 class PMCNetPhysicsEnhanced(PMCNetHardConstrainedReconstructor):
-    """PMCNet-Paper + физические улучшения (без NN-довесок).
+    """PMCNet-Paper + два физических улучшения, не связанных с обучением.
 
     База — `PMCNetPaper` (paper-faithful: Eq. 1–3 статьи через
-    `BasicAnalyticalForwardModel`). Сверх неё добавлены _только_ улучшения
-    физики, не связанные с машинным обучением, в основном инспирированные
-    Maxwell-PCNN (Scheinker 2023):
+    `BasicAnalyticalForwardModel`). Сверх неё добавлены ровно две
+    физические корректировки, не использующие методы машинного обучения:
 
-      ▸ Радиальная p(r) = 1/(1+(r/R_coil)²) вместо paper-uniform p(r) ≡ 1
-        (theory.md Eq. coil_sensitivity, заменяет `UniformCoilSensitivity`
-        на `RadialCoilSensitivity`) — учитывает реальный профиль приёмной
-        катушки, который у paper-симуляций неявно идеализирован.
+      ▸ Зависимость чувствительности катушки от расстояния до центра:
+        p(r) = 1 / (1 + (|r|/R_coil)²)  (RadialCoilSensitivity).
+        Ближе к краю FOV сигнал слабее, как в реальной приёмной катушке
+        с конечным радиусом. Paper-версия неявно использует p(r) ≡ 1,
+        что приводит к переоценке концентрации на периферии.
 
-      ▸ Центральная конечная разность ∂/∂t через _фиксированную_ Conv1d
-        с ядром [−1, 0, +1]/(2Δt) (Maxwell-PCNN Eq. 12–13, наш
-        `TimeDerivativeFD`) вместо paper-forward-FD (`TimeDerivativeForwardFD`):
-        точность O(Δt²) против O(Δt), что критично на длинных
-        Lissajous-траекториях.
-
-      ▸ Численно-устойчивый Langevin (`langevin_safe`) с 5-членным
-        Тейлором для |ξ| < 0.5 и устойчивой coth для |ξ| > 0.5. В paper
-        используется математическая `coth(ξ) − 1/ξ`, что в float32 даёт
-        NaN при ξ → 0 — наша версия закрывает этот разрыв.
-
-      ▸ Полная архитектурная цепочка (`AnalyticalForwardModel` через
-        `HardConstrainedSpectralForward`) пересчитывается _каждую_
-        итерацию — физика «живая», параметры (R_coil, m_sat, ...)
-        потенциально доступны для blind-calibration в будущем (как `A`
-        в Maxwell-PCNN, Eq. 14).
+      ▸ Адаптация функции Ланжевена для числовой стабильности
+        (`langevin_safe`): пятичленный ряд Тейлора для |ξ| < 0.5,
+        устойчивая форма coth для |ξ| > 0.5 и асимптотика 1 − 1/|ξ|
+        для |ξ| > 20. Прямой расчёт coth(ξ) − 1/ξ в float32 даёт
+        катастрофическое сокращение при ξ → 0 и регулярно сваливается
+        в NaN при типичных параметрах поля — наша версия закрывает
+        этот разрыв.
 
     Что НЕ изменилось относительно paper-PMCNet (`PMCNetPaper`):
       ▸ Архитектура сети (U-Net без shallow skip), вход z, loss L1, Adam.
-      ▸ Single color, без Debye (это улучшения в `PMCNetFinal`).
-      ▸ Без TV (это в `PMCNetFinal`).
+      ▸ Forward-difference для ∂M/∂t (центральная разность через Conv1d
+        перенесена в `PMCNetFinal` как нейросетевое улучшение).
+      ▸ Single color, без Debye, без TV (это всё в `PMCNetFinal`).
 
-    Назначение варианта — изолированно оценить вклад «более точной
-    физики» при том же NN-каркасе, что и в paper-варианте.
+    Назначение варианта — изолированно оценить вклад «более реалистичной
+    физики» при той же NN-стороне, что и в paper-варианте.
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1688,45 +1694,57 @@ class PMCNetPhysicsEnhanced(PMCNetHardConstrainedReconstructor):
             'n_colors': 1,
             'use_debye': False,
             'lambda_tv': 0.0,
+            # paper-faithful схема производной — центральная FD перенесена
+            # в PMCNetFinal как нейросетевое улучшение (см. требование
+            # пользователя)
+            'use_central_fd': False,
         })
         super().__init__(image_shape, n_meas_bins, config=cfg)
 
 
 class PMCNetFinal(PMCNetHardConstrainedRefinedReconstructor):
-    """PMCNetPhysicsEnhanced + полный набор NN-довесок (Debye + multi-color + TV).
+    """PMCNetPhysicsEnhanced + три нейросетевых/ML-улучшения.
 
-    База — `PMCNetPhysicsEnhanced` (paper-PMCNet + физические улучшения).
-    Сверх неё добавлены довески, относящиеся к NN-стороне или к
-    расширению физики из paper Sec. II.C–III:
+    База — `PMCNetPhysicsEnhanced` (paper-PMCNet + радиальная p +
+    langevin_safe). Сверх неё в финальной версии добавлены три метода,
+    расширяющие именно нейросетевую часть алгоритма машинного обучения:
 
-      ▸ Релаксация Дебая (paper Eq. 4–5, Sec. II.C — non-adiabatic
-        модель): применяется как частотный фильтр H_τ_k(f) = 1/(1 +
-        j·2π·f·τ_k) к выходу форварда. Каждая τ_k обучается через
-        softplus-параметризацию (положительность _by construction_,
-        как и c через sigmoid). Аналогично paper Sec. III.B: «we did
-        not provide the magnitude of the relaxation time constant
-        directly, but instead estimated it through the gradient
-        descent algorithm».
+      ▸ TV-регуляризация Σ λ·∑|∇c| на выходе сети — подавляет
+        высокочастотные шумовые артефакты на реконструированном
+        изображении. Default λ_TV = 1e-3 (компромисс между сглаживанием
+        и сохранением границ объектов).
 
-      ▸ Multi-color MPI (paper Sec. III): U-Net выводит K концентраций
-        c_1,…,c_K (по одной на тип МНЧ), итоговый сигнал —
-            U(f) = Σ_k H_τ_k(f) · ForwardOp(c_k).
-        Это прямой аналог декомпозиции компонент в Maxwell-PCNN
-        (Scheinker 2023, Eq. 10).
+      ▸ Точное вычисление производной намагниченности через специальный
+        сверточный слой: ∂M/∂t реализуется как Conv1d с фиксированным
+        ядром [−1, 0, +1]/(2Δt) — центральная разность, точность O(Δt²)
+        вместо O(Δt) у forward-FD из PhysicsEnhanced (Maxwell-PCNN
+        Eq. 12–13, `TimeDerivativeFD`). Фиксированное ядро делает
+        оператор полностью совместимым с autograd «бесплатно» и
+        переносимым на GPU без ручных циклов.
 
-      ▸ TV-регуляризация Σ_k λ·∑|∇c_k| для подавления шума реконструкции
-        (наше добавление, не из paper); default λ_TV = 1e-3.
+      ▸ Возможность учитывать инерционность частиц через обучаемый
+        параметр времени релаксации τ (релаксация Дебая, paper Eq. 4–5):
+        применяется как частотный фильтр H_τ(f) = 1/(1 + j·2π·f·τ) к
+        выходу форварда, эквивалентный временной свёртке с
+        r(t) = (1/τ)·exp(−t/τ). τ обучается совместно с весами сети
+        через softplus-параметризацию (положительность _by construction_),
+        как в paper Sec. III.B: «we did not provide the magnitude of the
+        relaxation time constant directly, but instead estimated it
+        through the gradient descent algorithm».
 
-      ▸ Hard constraints _by construction_ (PCNN-философия Scheinker 2023):
-            – sigmoid в head U-Net → c ∈ [0, 1] архитектурно;
-            – softplus(raw_τ)       → τ_k > 0 архитектурно;
-            – радиальная s(r) (из `PhysicsEnhanced`) — фиксированный
-              буфер по theory.md Eq. coil_sensitivity, не штраф в loss;
-            – ядро [−1, 0, +1]/(2Δt) для ∂/∂t (из `PhysicsEnhanced`) —
-              фиксированный буфер, аналог W_∂x в PCNN Eq. 12–13.
+    Дополнительно по умолчанию включён multi-color режим (paper Sec. III):
+    U-Net выводит K концентраций c_1, ..., c_K (по типу МНЧ), сигнал —
+    U(f) = Σ_k H_τ_k(f) · ForwardOp(c_k). Отключается через `n_colors=1`.
 
-    Иерархия: PMCNetPaper (paper-faithful) ⊂ PhysicsEnhanced (+phys
-    improvements) ⊂ Final (+Debye, +multi-color, +TV).
+    Hard constraints _by construction_ (PCNN-философия Scheinker 2023):
+      – sigmoid в head U-Net → c ∈ [0, 1] архитектурно;
+      – softplus(raw_τ)       → τ_k > 0 архитектурно;
+      – радиальная p(r) (из `PhysicsEnhanced`) — фиксированный буфер,
+        не штраф в loss;
+      – Conv1d-ядро для ∂/∂t — фиксированный буфер, не штраф.
+
+    Иерархия: PMCNetPaper (paper-faithful) ⊂ PhysicsEnhanced (+radial p,
+    +langevin_safe) ⊂ Final (+TV, +central FD, +обучаемая τ-Debye).
     """
 
     def __init__(self, image_shape: Tuple[int, int],
@@ -1740,6 +1758,9 @@ class PMCNetFinal(PMCNetHardConstrainedRefinedReconstructor):
             'n_colors': n_colors,
             'use_debye': True,
             'lambda_tv': max(base.lambda_tv, 1e-3),
+            # Точное ∂M/∂t через сверточный слой — нейросетевое улучшение
+            # из спецификации пользователя
+            'use_central_fd': True,
         })
         super().__init__(image_shape, n_meas_bins, config=cfg)
 

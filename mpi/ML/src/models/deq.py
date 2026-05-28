@@ -254,7 +254,18 @@ class DEQMPI(nn.Module):
 
     def forward(self, measurements: torch.Tensor,
                 return_intermediate: bool = False):
-        """measurements: (B, M) вещественные (расширенная форма)."""
+        """measurements: (B, M) вещественные (расширенная форма).
+
+        Память: O(1) по `n_iterations`. Реализован implicit-DEQ gradient
+        (Bai et al. 2019, Sec. 3.2): поиск неподвижной точки выполняется
+        под `torch.no_grad()`, после чего к найденному x* применяется
+        _один_ дополнительный шаг h_θ(x*), уже под autograd. Backward
+        идёт только через этот последний шаг — это 1-step Jacobian
+        approximation полного implicit-gradient, на практике даёт почти
+        ту же скорость сходимости, что и точный IFT, но требует памяти
+        порядка одной итерации вместо `n_iterations` (для 4 GB GPU
+        unrolled-вариант с n=25 переполнял VRAM на batch=8).
+        """
         # Начальное приближение: A^T·y (см. статья Sec IV.B "x is
         # initialized with the least-squares solution xLS = A†·y"; здесь
         # упрощённо берём adjoint, что эффективно при whitening).
@@ -262,7 +273,9 @@ class DEQMPI(nn.Module):
         x = F.relu(x)
 
         if return_intermediate:
-            # Простая итерация для возможности сохранения промежуточных
+            # Сохранение промежуточных шагов несовместимо с экономной
+            # памятью — этот режим только для отладки/визуализации, не
+            # для тренировки. Граф будет полным.
             history = [x]
             for _ in range(self.n_iterations):
                 x_prev = x
@@ -272,14 +285,21 @@ class DEQMPI(nn.Module):
                     break
             return x, history
 
-        if self.use_anderson:
-            x = self._anderson_solve(x, measurements)
-        else:
-            for _ in range(self.n_iterations):
-                x_prev = x
-                x = self._step(x, measurements)
-                if torch.norm(x - x_prev) < self.tol:
-                    break
+        # 1) Поиск неподвижной точки без сохранения autograd-графа
+        with torch.no_grad():
+            if self.use_anderson:
+                x = self._anderson_solve(x, measurements)
+            else:
+                for _ in range(self.n_iterations):
+                    x_prev = x
+                    x = self._step(x, measurements)
+                    if torch.norm(x - x_prev) < self.tol:
+                        break
+
+        # 2) Один шаг под autograd для backward
+        # (1-step gradient approximation полного implicit-gradient)
+        if self.training:
+            x = self._step(x.detach(), measurements)
         return x
 
     # ----- инициализация (КРИТИЧНО, см. статья Sec V.A) -----
