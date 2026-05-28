@@ -427,7 +427,22 @@ def build_dip(image_shape):
 # --- Shang 2022 FDS-MPI -----------------------------------------------------
 
 def train_or_load_shang(X_train, y_train, SM, train: bool = True,
-                        epochs: int = 40):
+                        epochs: int = 10, tik_kmax: int = 5,
+                        max_train_samples: int = 300):
+    """[ВРЕМЕННО ОТКЛЮЧЁН в `run_pipeline`] FDS-MPI Shang 2022.
+
+    Узкое место — Tikhonov-препроцессинг на каждый X_train (на 3000
+    семплов с kmax=15 это ~3 с/семпл = 2.5 часа _до_ старта тренировки
+    самой сети). Дефолты уменьшены, чтобы при включении функция
+    отработала за разумное время:
+      • epochs: 40 → 10
+      • Tikhonov kmax: 15 → 5
+      • Ограничиваем сабсет до 300 семплов через `max_train_samples`
+        (Shang всё равно учит постпроцессинг, для него полный датасет
+        избыточен).
+
+    Чтобы включить обратно — раскомментируйте вызов в `run_pipeline`.
+    """
     print("\n  Shang (2022) FDS-MPI dual-branch...")
     path = './DATA/models/shang_best.pth'
     dev = device()
@@ -440,19 +455,27 @@ def train_or_load_shang(X_train, y_train, SM, train: bool = True,
         print("    загружена")
         return model
 
+    # Ограничиваем сабсет — Tikhonov-препроцессинг очень медленный
+    n = min(max_train_samples, len(X_train))
+    if n < len(X_train):
+        idx = np.random.choice(len(X_train), n, replace=False)
+        X_train = X_train[idx]
+        y_train = y_train[idx]
+        print(f"    Сабсет {n}/{len(idx)} семплов для ускорения "
+              f"Tikhonov-prep")
+
     # FDS-MPI — постпроцессинг: на вход даём грубую LOW-RES реконструкцию,
     # цель — точное y. В статье вход — это X-space-реконструкция при
     # слабом градиенте. Здесь используем Tikhonov как ближайший аналог
-    # (гладкое регуляризованное решение). Это критично: чистая
-    # псевдо-обратная матрица на шумящих данных взрывается, и сеть
-    # учится «гладить» взрыв вместо повышения разрешения.
+    # (гладкое регуляризованное решение).
     from .models.classical import TikhonovReconstructor
     tik = TikhonovReconstructor(SM)
     inputs = []
     for m in tqdm(X_train, desc='    Shang: prep Tikhonov inputs',
                   leave=False):
         v = np.concatenate([m[0], m[1]])
-        recon = tik.reconstruct(v, mu=1e-2, kmax=15).reshape(*y_train.shape[1:])
+        recon = tik.reconstruct(v, mu=1e-2,
+                                 kmax=tik_kmax).reshape(*y_train.shape[1:])
         inputs.append(recon)
     X_lr = np.array(inputs, dtype=np.float32)[:, None]
     y_hr = y_train.astype(np.float32)[:, None]
@@ -584,18 +607,6 @@ def build_pmcnet_quartet(SM, image_shape,
     return standard, paper, phys, final
 
 
-# Legacy alias — старый код, который вызывает build_pmcnet_trio
-def build_pmcnet_trio(SM, image_shape, n_iterations: int = 1500,
-                       n_colors: int = 2, init_tau_seconds: float = 2.0e-6):
-    """[legacy] Возвращает (standard, physics_enhanced, final) без Paper.
-
-    Сохранено для обратной совместимости; новый код должен использовать
-    `build_pmcnet_quartet`.
-    """
-    std, _paper, phys, fin = build_pmcnet_quartet(
-        SM, image_shape, n_iterations, n_colors, init_tau_seconds
-    )
-    return std, phys, fin
 
 
 # ---------------------------------------------------------------------------
@@ -869,7 +880,13 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     chae_single, chae_multi = train_or_load_chae(
         SM, image_shape, X_train, y_train, train=train_models)
     dip = build_dip(image_shape)
-    shang = train_or_load_shang(X_train, y_train, SM, train=train_models)
+    # Shang FDS-MPI временно отключён — Tikhonov-препроцессинг на
+    # каждый X_train занимает ~3 с/семпл (на 3000 семплов = 2.5 часа
+    # ДО старта тренировки сети). См. `train_or_load_shang` — там
+    # дефолты уже уменьшены (epochs=10, kmax=5, max_train_samples=300).
+    # Раскомментируйте обе строки ниже, чтобы включить обратно.
+    # shang = train_or_load_shang(X_train, y_train, SM, train=train_models)
+    shang = None
     deq = train_or_load_deq(SM, image_shape, X_train, y_train, train=train_models)
     pmcnet_std, pmcnet_paper, pmcnet_phys, pmcnet_final = build_pmcnet_quartet(
         SM, image_shape, n_iterations=pmcnet_iterations, n_colors=2,
@@ -883,7 +900,8 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     cmp.set_diffusion_model(diff)
     cmp.set_chae_model(chae_single)
     cmp.set_dip_model(dip)
-    cmp.set_shang_model(shang)
+    if shang is not None:
+        cmp.set_shang_model(shang)
     cmp.set_deq_model(deq)
     cmp.set_pmcnet_standard(pmcnet_std)
     cmp.set_pmcnet_paper(pmcnet_paper)
@@ -896,12 +914,15 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
                                 kmax=20, n_val_samples=12)
     cmp.set_tikhonov_mu(best_mu)
 
-    # 2.5) MoE поверх быстрых экспертов
+    # 2.5) MoE поверх быстрых экспертов (Shang исключён — отключён выше)
+    moe_experts = ['Тихонов', 'KatsMarc', 'Chae(2017)', 'CNN']
+    if shang is not None:
+        moe_experts.insert(3, 'Shang(2022)')
     moe = build_moe(
         comparator=cmp,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
-        expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'Shang(2022)', 'CNN'),
+        expert_names=tuple(moe_experts),
         n_train_samples=128,
         epochs=80,
         mode='spatial',

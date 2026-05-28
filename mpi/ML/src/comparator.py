@@ -11,10 +11,6 @@ from tqdm import tqdm
 
 from .models import (
     TikhonovReconstructor, KatsMarcAlgorithm,
-    ChaeSingleLayerNN, ChaeMultiLayerNN,
-    DeepImagePrior, ShangCNN, DEQMPI,
-    PMCNetReconstructor, PMCNetRefinedReconstructor,
-    PMCNetStandard, PMCNetPhysicsEnhanced, PMCNetFinal,
 )
 from .metrics import MetricsCalculator
 from .visualization import Visualization
@@ -36,8 +32,6 @@ class MPIReconstructionComparator:
         self.shang_model = None
         self.deq_model = None
         # PMCNet (Huang et al., 2026) — три варианта в одной системе координат
-        self.pmcnet_reconstructor = None              # legacy alias for Standard
-        self.pmcnet_refined_reconstructor = None       # legacy alias for Final
         self.pmcnet_standard = None                    # 1) измеренная SM (baseline)
         self.pmcnet_paper = None                       # 2) paper-faithful (Huang 2026 Eq. 1-3)
         self.pmcnet_physics_enhanced = None            # 3) paper + physical улучшения
@@ -111,18 +105,6 @@ class MPIReconstructionComparator:
     def set_deq_model(self, deq_model):
         """Установка модели DEQ-MPI (Güngör et al., 2024)"""
         self.deq_model = deq_model
-
-    def set_pmcnet_model(self, pmcnet_reconstructor):
-        """[legacy] Алиас для `set_pmcnet_standard`."""
-        self.pmcnet_reconstructor = pmcnet_reconstructor
-        if self.pmcnet_standard is None:
-            self.pmcnet_standard = pmcnet_reconstructor
-
-    def set_pmcnet_refined_model(self, pmcnet_refined_reconstructor):
-        """[legacy] Алиас для `set_pmcnet_final`."""
-        self.pmcnet_refined_reconstructor = pmcnet_refined_reconstructor
-        if self.pmcnet_final is None:
-            self.pmcnet_final = pmcnet_refined_reconstructor
 
     def set_pmcnet_standard(self, reconstructor):
         """Вариант 1 — PMCNet-Standard (SM-baseline, _не_ из paper).
@@ -502,15 +484,6 @@ class MPIReconstructionComparator:
         self.last_pmcnet_taus_seconds = taus
         recon = c_np.sum(axis=0) if c_np.ndim == 3 else c_np
         return self._postprocess_recon(recon)
-
-    # -- legacy-обёртки (сохраняют прежний интерфейс) -------------------------
-    def pmcnet_reconstruction(self, measurement, n_iterations=None):
-        """[legacy] Алиас для `pmcnet_standard_reconstruction`."""
-        return self.pmcnet_standard_reconstruction(measurement, n_iterations)
-
-    def pmcnet_refined_reconstruction(self, measurement, n_iterations=None):
-        """[legacy] Алиас для `pmcnet_final_reconstruction`."""
-        return self.pmcnet_final_reconstruction(measurement, n_iterations)
 
     # ====================================================================
     # МЕТОД 6: KatsMarc (Алгоритм Кацмарца, 1937)
