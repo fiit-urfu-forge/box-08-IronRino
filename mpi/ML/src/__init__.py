@@ -3,8 +3,7 @@
 Структура:
   data/      генерация и загрузка данных (phantoms, simulators,
              datasets, openmpi);
-  models/    модели реконструкции (classical, chae, dip, shang, deq,
-             simple, pmcnet);
+  models/    модели реконструкции (classical, chae, dip, simple, pmcnet);
   trainer.py инфраструктура обучения;
   comparator.py сравнение методов на синтетике и OpenMPI;
   pipeline.py end-to-end orchestration (entry point — `run_pipeline`).
@@ -21,15 +20,15 @@ from .data import (
 from .models import (
     TikhonovReconstructor, KatsMarcAlgorithm,
     ChaeSingleLayerNN, ChaeMultiLayerNN,
-    DeepImagePrior, ShangCNN, FDSMPI,
-    DEQMPI, RDNBlock, LCBlock,
+    DeepImagePrior,
     MPIReconstructionCNN, MoDLNetwork, DiffusionModel,
     MoEReconstructor,
     PMCNetConfig,
     PMCNet, PMCNetWithBasicPhysics,
     PMCNetReconstructor, PMCNetPaperReconstructor,
     PMCNetStandard, PMCNetPaper,
-    PMCNetPhysicsEnhanced, PMCNetFinal,
+    PMCNetRadialCoil, PMCNetSoftConstrained,
+    PMCNetDebye, PMCNetCentralFD,
     DebyeRelaxationFilter, SystemMatrixForward,
     RadialCoilSensitivity, LissajousFFPTrajectory,
     TimeDerivativeFD, LangevinMagnetization,
@@ -54,15 +53,15 @@ __all__ = [
     # Models
     'TikhonovReconstructor', 'KatsMarcAlgorithm',
     'ChaeSingleLayerNN', 'ChaeMultiLayerNN',
-    'DeepImagePrior', 'ShangCNN', 'FDSMPI',
-    'DEQMPI', 'RDNBlock', 'LCBlock',
+    'DeepImagePrior',
     'MPIReconstructionCNN', 'MoDLNetwork', 'DiffusionModel',
     'MoEReconstructor',
     'PMCNetConfig',
     'PMCNet', 'PMCNetWithBasicPhysics',
     'PMCNetReconstructor', 'PMCNetPaperReconstructor',
     'PMCNetStandard', 'PMCNetPaper',
-    'PMCNetPhysicsEnhanced', 'PMCNetFinal',
+    'PMCNetRadialCoil', 'PMCNetSoftConstrained',
+    'PMCNetDebye', 'PMCNetCentralFD',
     'DebyeRelaxationFilter', 'SystemMatrixForward',
     'RadialCoilSensitivity', 'LissajousFFPTrajectory',
     'TimeDerivativeFD', 'LangevinMagnetization',

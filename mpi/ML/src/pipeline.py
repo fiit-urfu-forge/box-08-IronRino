@@ -1,24 +1,68 @@
-"""Финальный pipeline сравнения методов реконструкции MPI.
+"""End-to-end pipeline сравнения методов реконструкции MPI.
 
-Шаги (вызываются из `run_pipeline`):
+## Что делает этот модуль
 
-  1. Генерация синтетического датасета — оба пути из Chae (2017):
-       • системная матрица (Chebyshev SM);
-       • прямые физические уравнения (функция Ланжевена).
-  2. Обучение/загрузка всех моделей:
-       классические    — Tikhonov, Kaczmarz;
-       по статьям      — Chae (single & multi-layer), DIP, Shang/FDS-MPI,
-                         DEQ-MPI, PMCNet (Standard / Physics-Enhanced / Final);
-       baseline'ы      — CNN, MoDL, DiffusionModel.
-  3. Сравнение методов на двух-капельных фантомах (разные радиусы и
-     расстояния) на основе ИЗМЕРЕННОЙ системной матрицы из
-     BeihangUniversityData.
-  4. Валидация на OpenMPIData-датасете.
-  5. Сводные метрики (SSIM/PSNR/FWHM/время), визуализация, текстовый отчёт.
+Главная точка входа — `run_pipeline()`. Она проходит весь жизненный
+цикл эксперимента:
 
-Все «по-настоящему обучаемые» модели поддерживают режимы train/load.
-PMCNet и DIP — data-free, обучения не требуют. Tikhonov/Kaczmarz —
-аналитические, без параметров.
+  1. **Генерация синтетического датасета.** Создаёт обучающую выборку
+     двумя путями:
+       • SM-путь: через измеренную системную матрицу из калибровки
+         сканера (учитывает все реальные несовершенства);
+       • physical-путь: через аналитический физический форвард
+         (идеализированная физика, без калибровочных артефактов).
+     Это даёт две параллельные оценки методов — на «реальных» и
+     «идеальных» данных.
+
+  2. **Обучение/загрузка всех моделей реконструкции.** Четыре категории:
+       • Классические: Tikhonov, Kaczmarz (без обучения, без параметров);
+       • Архитектурные baseline'ы: CNN, MoDL, Diffusion;
+       • Прямая регрессия: Chae 2017 (single + multi-layer FC);
+       • Физически-ограниченные: PMCNet (4 варианта — Standard, Paper,
+         PhysicsEnhanced, Final).
+
+     Обучение каждой модели можно пропустить, передав `train_models=False`
+     (тогда загружаются заранее сохранённые веса).
+
+  3. **Сборка тестовой батареи фантомов.** Шесть типов:
+       two_droplets, phantom_4, rotation_45, shape_ring, random,
+       letter_B (последний — реальное измерение со сканера).
+     На каждый из пяти первых — два пути измерения (sm + physical),
+     получаем 11 экспериментов на батарею.
+
+  4. **Запуск сравнительной таблицы.** Каждый метод реконструирует
+     каждый эксперимент, метрики (SSIM/PSNR/FWHM/время) сохраняются в
+     общую таблицу с визуализациями.
+
+  5. **MoE-сборка.** Опциональное комбинирование нескольких быстрых
+     методов через Mixture of Experts.
+
+  6. **Валидация на OpenMPIData (опционально).** Реальные измерения
+     с публичного MPI-датасета.
+
+## Train/Load переключение
+
+  • `train_models=True`: обучает все supervised-модели (CNN, MoDL,
+    Chae, Diffusion). Веса сохраняются в DATA/models/.
+  • `train_models=False`: загружает заранее обученные веса. Полезно
+    для повторного прогона на новых фантомах без полного обучения.
+
+Data-free методы (DIP, PMCNet × 4) НЕ требуют обучения вообще —
+они оптимизируют веса U-Net на каждом измерении отдельно. Это
+существенно медленнее на этапе сравнения (минуты на измерение), но
+не требует подготовки.
+
+## Размеры данных
+
+  • Изображения: (51, 51) пикселей (формат BeihangUniversityData);
+  • Измерения: complex (2, 1275) per phantom (2 катушки × 1275 гармоник);
+  • Системная матрица: complex (2550, 2601).
+
+## Гиперпараметры
+
+Главные на уровне `run.py`:
+  • NUM_SAMPLES: размер обучающего синтетического датасета;
+  • PMCNET_ITER: число итераций для data-free методов (PMCNet, DIP).
 """
 
 import argparse
@@ -38,9 +82,10 @@ from .data.simulators import (
 from .data.phantoms import PhantomType
 from .models import (
     ChaeSingleLayerNN, ChaeMultiLayerNN,
-    DeepImagePrior, ShangCNN, DEQMPI,
+    DeepImagePrior,
     PMCNetConfig, PMCNetStandard, PMCNetPaper,
-    PMCNetPhysicsEnhanced, PMCNetFinal,
+    PMCNetRadialCoil, PMCNetSoftConstrained,
+    PMCNetDebye, PMCNetCentralFD,
     MoEReconstructor,
     build_analytical_system_matrix,
 )
@@ -70,14 +115,26 @@ def device():
 # ---------------------------------------------------------------------------
 
 
-def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True):
-    """Сгенерировать датасет двумя путями + сохранить визуализацию фантомов.
+def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True,
+                                force_regenerate: bool = False):
+    """Сгенерировать или загрузить датасеты двумя путями.
 
-    Возвращает: (generator, dataset_sm) — генератор для повторных вызовов
-    и основной датасет (через системную матрицу).
+    При первом вызове: создаёт SM-путь и physical-путь, сохраняет на диск.
+    При повторных: загружает сохранённые с диска, минуя дорогую генерацию.
+
+    Args:
+        num_samples: размер SM-датасета (для PHYS используется
+                     min(500, num_samples//3) — physical-форвард медленнее).
+        save: сохранять ли датасеты на диск при первой генерации.
+        force_regenerate: если True, игнорирует сохранённые файлы и
+                          генерирует заново. Полезно при изменении
+                          конфигурации (типов фантомов, размеров частиц).
+
+    Returns:
+        (generator, dataset_sm) — генератор + основной (SM) датасет.
     """
     print("\n" + "=" * 70)
-    print("1. ГЕНЕРАЦИЯ СИНТЕТИЧЕСКИХ ДАННЫХ (Chae 2017)")
+    print("1. СИНТЕТИЧЕСКИЕ ДАННЫЕ (SM + physical пути)")
     print("=" * 70)
 
     generator = SyntheticDatasetGenerator(nx=51, ny=51, n_harmonics=200)
@@ -87,27 +144,44 @@ def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True):
         save_path='./DATA/results/phantoms/all_phantoms.png',
     )
 
-    # Путь 1: через системную матрицу (быстрее, более линейно)
-    print(f"\n  Путь 1: SM-генерация, {num_samples} образцов...")
-    dataset_sm = generator.create_training_pipeline_dataset(
-        n_samples=num_samples, include_all_phantoms=True, save=save,
-    )
+    sm_prefix = './DATA/dataset/synthetic_complete'
+    phys_prefix = './DATA/dataset/synthetic_physical'
 
-    # Путь 2: через физические уравнения (для валидации/сравнения)
-    print(f"\n  Путь 2: физические уравнения, {min(500, num_samples // 3)} образцов...")
-    dataset_phys = generator.generate_dataset(
-        n_samples=min(500, num_samples // 3),
-        method='physical',
-        phantom_types=[PhantomType.TWO_DROPLETS, PhantomType.PHANTOM_4,
-                       PhantomType.CONCENTRATION, PhantomType.RESOLUTION,
-                       PhantomType.SHAPE, PhantomType.PATTERN],
-        particle_sizes_nm=[30, 40, 50],
-        add_noise=True, snr_db=35.0, test_split=0.2,
-    )
-    if save:
-        generator.save_dataset(dataset_phys, './DATA/dataset/synthetic_physical')
+    # --- Путь 1: SM-генерация ---
+    if not force_regenerate and SyntheticDatasetGenerator.dataset_exists(sm_prefix):
+        print(f"\n  Путь 1 (SM): загрузка из {sm_prefix}_*.npy ...")
+        dataset_sm = SyntheticDatasetGenerator.load_dataset(sm_prefix)
+        print(f"    загружено: {len(dataset_sm['X_train'])} train + "
+              f"{len(dataset_sm['X_test'])} test")
+    else:
+        print(f"\n  Путь 1 (SM): генерация {num_samples} образцов...")
+        dataset_sm = generator.create_training_pipeline_dataset(
+            n_samples=num_samples, include_all_phantoms=True, save=save,
+        )
 
-    print(f"\n  Готово: SM = {len(dataset_sm['X_train'])} train, "
+    # --- Путь 2: physical-генерация ---
+    n_phys = min(500, num_samples // 3)
+    if not force_regenerate and SyntheticDatasetGenerator.dataset_exists(phys_prefix):
+        print(f"\n  Путь 2 (physical): загрузка из {phys_prefix}_*.npy ...")
+        dataset_phys = SyntheticDatasetGenerator.load_dataset(phys_prefix)
+        print(f"    загружено: {len(dataset_phys['X_train'])} train + "
+              f"{len(dataset_phys['X_test'])} test")
+    else:
+        print(f"\n  Путь 2 (physical): генерация {n_phys} образцов (медленнее)...")
+        dataset_phys = generator.generate_dataset(
+            n_samples=n_phys,
+            method='physical',
+            phantom_types=[PhantomType.TWO_DROPLETS, PhantomType.PHANTOM_4,
+                           PhantomType.ROTATION, PhantomType.MULTI_POINT,
+                           PhantomType.LINES, PhantomType.CIRCLES],
+            particle_sizes_nm=[30, 40, 50],
+            add_noise=True, snr_db=35.0, test_split=0.2,
+        )
+        if save:
+            generator.save_dataset(dataset_phys, phys_prefix)
+            print(f"    сохранено в {phys_prefix}_*.npy")
+
+    print(f"\n  Итого: SM = {len(dataset_sm['X_train'])} train, "
           f"phys = {len(dataset_phys['X_train'])} train.")
     return generator, dataset_sm
 
@@ -171,16 +245,35 @@ def _save_curve(losses, name, fname):
 
 
 def _model_input_dim(X_train):
-    """Размер развёрнутого «комплекс → 4·M» вектора (Re/Im на 2 катушки)."""
-    return X_train.shape[2] * 4
+    """Размер амплитудного спектра по 2 катушкам = 2·M_per_coil.
+
+    Chae 2017 работает со СПЕКТРОМ АМПЛИТУД |u|, а не с Re/Im (paper
+    Sec. III.1, Fig. 3a). Это связано с тем, что обучаемые веса W
+    стремятся к полиномам Чебышёва — то есть к псевдо-обращению
+    спектра амплитуд. На Re/Im формате эта структура не возникает.
+    """
+    return X_train.shape[2] * 2
 
 
 def _flatten_measurement_batch(X):
-    """(N, 2, M) комплекс → (N, 4·M) вещественный."""
-    real = X.real; imag = X.imag
-    out = np.concatenate([real[:, 0], imag[:, 0],
-                          real[:, 1], imag[:, 1]], axis=-1)
-    return out.astype(np.float32)
+    """(N, 2, M_per_coil) комплекс → (N, 2·M_per_coil) амплитудный
+    спектр, нормированный per-sample на max(|u|).
+
+    Per-sample max-нормализация:
+      • инвариантна к глобальной амплитуде сигнала (sensitivity,
+        концентрация образца) — модель видит «форму» спектра, не уровень;
+      • не требует сохранения статистик scaler_mean/scale на диске;
+      • сопоставима с поведением sigmoid-выхода Chae (значения в [0,1]).
+
+    Согласовано с `comparator.chae_reconstruction`, который применяет
+    тот же препроцессинг на инференсе.
+    """
+    abs_spec = np.abs(X)                                  # (N, 2, M)
+    flat = abs_spec.reshape(len(X), -1).astype(np.float32)
+    # Per-sample max-нормировка
+    s = flat.max(axis=-1, keepdims=True)
+    s = np.where(s > 0, s, 1.0)
+    return flat / s
 
 
 def _synthesize_measurements_through_SM(y_images, SM,
@@ -191,7 +284,7 @@ def _synthesize_measurements_through_SM(y_images, SM,
     Синтетический генератор по умолчанию использует Chebyshev-SM с
     `n_harmonics=200`, что даёт X-шейпы, несовместимые с измеренной SM
     (которая обычно 2·n_freq_per_coil × N). Чтобы все обучаемые модели
-    (CNN/MoDL/Chae/Shang/DEQ) видели данные правильной размерности,
+    (CNN/MoDL/Chae) видели данные правильной размерности,
     регенерируем `X = S · y` для каждого изображения y.
 
     Args:
@@ -232,10 +325,10 @@ def _format_for_cnn(X_complex):
     return out.reshape(N, 4, S, S)
 
 
-def _format_for_modl_deq(X_complex):
+def _format_for_modl(X_complex):
     """(N, 2, M_per_coil) complex → (N, 4·M_per_coil) real.
 
-    Для MoDL/DEQ — вход — расширенное (Re, Im) представление измерения
+    Для MoDL — вход — расширенное (Re, Im) представление измерения
     в форме одного вектора длины 2·M_total = 4·M_per_coil. Порядок:
     [coil0.real, coil1.real, coil0.imag, coil1.imag].
     """
@@ -280,7 +373,7 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
     path = './DATA/models/modl_best.pth'
     trainer = ModelTrainerFactory.create_modl_trainer(
         system_matrix=SM, image_shape=image_shape,
-        n_iterations=3, lambda_param=0.01, base_filters=32,
+        n_iterations=5, lambda_param=0.05, base_filters=32,
     )
     if not train and os.path.exists(path):
         ckpt = torch.load(path, map_location='cpu')
@@ -288,7 +381,7 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
         print("    загружена")
         return trainer
 
-    X_real = _format_for_modl_deq(X_train)            # (N, 2·M_total)
+    X_real = _format_for_modl(X_train)            # (N, 2·M_total)
     ds = TensorDataset(
         torch.tensor(X_real),
         torch.tensor(y_train[:, None], dtype=torch.float32),
@@ -424,192 +517,117 @@ def build_dip(image_shape):
                           base_channels=32).to(device())
 
 
-# --- Shang 2022 FDS-MPI -----------------------------------------------------
 
-def train_or_load_shang(X_train, y_train, SM, train: bool = True,
-                        epochs: int = 10, tik_kmax: int = 5,
-                        max_train_samples: int = 300):
-    """[ВРЕМЕННО ОТКЛЮЧЁН в `run_pipeline`] FDS-MPI Shang 2022.
+# --- PMCNet ablation sextet (data-free) ------------------------------------
 
-    Узкое место — Tikhonov-препроцессинг на каждый X_train (на 3000
-    семплов с kmax=15 это ~3 с/семпл = 2.5 часа _до_ старта тренировки
-    самой сети). Дефолты уменьшены, чтобы при включении функция
-    отработала за разумное время:
-      • epochs: 40 → 10
-      • Tikhonov kmax: 15 → 5
-      • Ограничиваем сабсет до 300 семплов через `max_train_samples`
-        (Shang всё равно учит постпроцессинг, для него полный датасет
-        избыточен).
+def build_pmcnet_variants(SM, image_shape,
+                           n_iterations: int = 1500,
+                           init_tau_seconds: float = 1.0e-9,
+                           scanner_h5_path: Optional[str] = None):
+    """Собрать шесть вариантов PMCNet для ablation-сравнения.
 
-    Чтобы включить обратно — раскомментируйте вызов в `run_pipeline`.
-    """
-    print("\n  Shang (2022) FDS-MPI dual-branch...")
-    path = './DATA/models/shang_best.pth'
-    dev = device()
-    # base_filters=64 как в статье Shang 2022 (см. Sec. 3.2: "the number
-    # of filters of the other layers was set to 64")
-    model = ShangCNN(input_channels=1, output_channels=1, base_filters=64).to(dev)
-    if not train and os.path.exists(path):
-        model.load_state_dict(torch.load(path, map_location=dev),
-                              strict=False)
-        print("    загружена")
-        return model
+    Структура: одна общая «база» (PhysicsEnhanced) + три параллельные
+    ветки одиночных улучшений. Каждая ветка добавляет ровно ОДИН
+    компонент к базовой физике, чтобы можно было независимо оценить его
+    вклад в метрики:
 
-    # Ограничиваем сабсет — Tikhonov-препроцессинг очень медленный
-    n = min(max_train_samples, len(X_train))
-    if n < len(X_train):
-        idx = np.random.choice(len(X_train), n, replace=False)
-        X_train = X_train[idx]
-        y_train = y_train[idx]
-        print(f"    Сабсет {n}/{len(idx)} семплов для ускорения "
-              f"Tikhonov-prep")
+           PMCNet-Std (измеренная SM)
+           PMCNet-Paper (аналитическая, paper-faithful)
+                 │
+                 ▼
+           PMCNet-Phys     ◄── базовая физика (radial p + langevin_safe)
+                 │
+       ┌─────────┼─────────┐
+       ▼         ▼         ▼
+     Soft      Debye    CentralFD
+     (soft     (Debye   (Conv1d
+     loss)    relax.)   ∂/∂t)
 
-    # FDS-MPI — постпроцессинг: на вход даём грубую LOW-RES реконструкцию,
-    # цель — точное y. В статье вход — это X-space-реконструкция при
-    # слабом градиенте. Здесь используем Tikhonov как ближайший аналог
-    # (гладкое регуляризованное решение).
-    from .models.classical import TikhonovReconstructor
-    tik = TikhonovReconstructor(SM)
-    inputs = []
-    for m in tqdm(X_train, desc='    Shang: prep Tikhonov inputs',
-                  leave=False):
-        v = np.concatenate([m[0], m[1]])
-        recon = tik.reconstruct(v, mu=1e-2,
-                                 kmax=tik_kmax).reshape(*y_train.shape[1:])
-        inputs.append(recon)
-    X_lr = np.array(inputs, dtype=np.float32)[:, None]
-    y_hr = y_train.astype(np.float32)[:, None]
-    ds = TensorDataset(torch.tensor(X_lr), torch.tensor(y_hr))
-    loader = DataLoader(ds, batch_size=16, shuffle=True)
-    crit = torch.nn.MSELoss()
-    opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-    losses = []
-    for ep in tqdm(range(epochs), desc='    Shang'):
-        ep_loss = 0.0
-        for xb, yb in loader:
-            xb = xb.to(dev); yb = yb.to(dev)
-            opt.zero_grad()
-            loss = crit(model(xb), yb)
-            loss.backward()
-            opt.step()
-            ep_loss += loss.item()
-        losses.append(ep_loss / len(loader))
-    torch.save(model.state_dict(), path)
-    _save_curve(losses, 'Shang FDS-MPI',
-                './DATA/results/training_curves/shang_training.png')
-    return model
-
-
-# --- DEQ-MPI ----------------------------------------------------------------
-
-def train_or_load_deq(SM, image_shape, X_train, y_train,
-                      train: bool = True, epochs: int = 40):
-    print("\n  DEQ-MPI (Güngör 2024) — RDN + LC...")
-    path = './DATA/models/deq_best.pth'
-    dev = device()
-    # Архитектура строго из статьи Güngör 2024 Sec IV.A:
-    # n_res=4, F_R=12, n_conv=12, n_LC=1, F_LC=8, ε=√M, 25 итер с Anderson.
-    model = DEQMPI(system_matrix=SM, image_shape=image_shape,
-                   n_iterations=25, lambda_param=1.0,
-                   rdn_channels=12, n_rdn_modules=4,
-                   rdn_convs_per_module=12,
-                   lc_hidden=8, use_anderson=True).to(dev)
-    if not train and os.path.exists(path):
-        ckpt = torch.load(path, map_location=dev)
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
-        print("    загружена")
-        return model
-
-    X_real = _format_for_modl_deq(X_train)
-    y_img = y_train[:, None].astype(np.float32)
-
-    # КРИТИЧНО (статья Sec V.A): pre-train RDN и LC отдельно перед
-    # основным обучением. Без этого PSNR падает на 7–17 dB.
-    # batch_size=4 — компромисс для GPU с 4 GB VRAM. Основной OOM-fix
-    # реализован внутри DEQMPI.forward через implicit-DEQ gradient
-    # (память O(1) по числу итераций); этот batch_size — дополнительный
-    # запас для очень тесных GPU.
-    deq_batch = 4
-    pretrain_eps = max(5, epochs // 3)
-    print(f"    [init 1/2] Pre-train RDN как denoiser ({pretrain_eps} эп., σ₁=0.1)...")
-    y_img_t = torch.tensor(y_img)
-    model.pretrain_rdn(y_img_t, sigma1=0.1, epochs=pretrain_eps, lr=1e-3,
-                       batch_size=deq_batch)
-    print(f"    [init 2/2] Pre-train LC как L2-проекция ({pretrain_eps} эп., σ₂=0.05, σ₃=0.02)...")
-    # Чистые измерения y_clean = SM @ y_train (без шума)
-    y_clean = np.zeros_like(X_real)
-    A_np = model.A.cpu().numpy()
-    for i in tqdm(range(len(y_img)), desc='    DEQ: prep y_clean = SM·c',
-                  leave=False):
-        c = y_img[i, 0].flatten()
-        y_clean[i] = A_np @ c
-    model.pretrain_lc(torch.tensor(y_clean), sigma2=0.05, sigma3=0.02,
-                      epochs=pretrain_eps, lr=1e-3, batch_size=deq_batch)
-
-    ds = TensorDataset(torch.tensor(X_real), torch.tensor(y_img))
-    loader = DataLoader(ds, batch_size=deq_batch, shuffle=True)
-    crit = torch.nn.L1Loss()  # статья: L1 на выходе
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3,
-                           betas=(0.9, 0.999))  # статья: Adam β=(0.9, 0.999)
-    losses = []
-    best = float('inf')
-    for ep in tqdm(range(epochs), desc='    DEQ'):
-        ep_loss = 0.0
-        for xb, yb in loader:
-            xb = xb.to(dev); yb = yb.to(dev)
-            opt.zero_grad()
-            y_pred = model(xb)
-            loss = crit(y_pred, yb)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            opt.step()
-            ep_loss += loss.item()
-        avg = ep_loss / len(loader)
-        losses.append(avg)
-        if avg < best:
-            best = avg
-            torch.save({'model_state_dict': model.state_dict()}, path)
-    _save_curve(losses, 'DEQ-MPI',
-                './DATA/results/training_curves/deq_training.png')
-    return model
-
-
-# --- PMCNet trio (data-free) -----------------------------------------------
-
-def build_pmcnet_quartet(SM, image_shape,
-                          n_iterations: int = 1500, n_colors: int = 2,
-                          init_tau_seconds: float = 2.0e-6):
-    """Собрать четыре варианта PMCNet (data-free, paper Sec. III.B).
+    Args:
+        scanner_h5_path: путь к SystemMatrix.h5 (или любому H5 MDF).
+            Если задан, для PMCNet-Paper подгружаются точные физические
+            параметры сканера и явный DFT на frequencySelection.
 
     Returns:
-        (standard, paper, physics_enhanced, final)
-          standard: SM-baseline (не из paper), форвард = S_measured · c
-          paper:    paper-faithful Huang 2026 (Eq. 1-3), базовая физика
-          physics_enhanced: paper + радиальная p, центр. FD, langevin_safe
-          final:    PhysicsEnhanced + Debye + multi-color + TV
+        Словарь {name: reconstructor} с 6 ключами:
+          'standard', 'paper', 'radial_coil', 'soft', 'debye', 'central_fd'.
+
+    Структура наследования:
+        PMCNetStandard (измеренная SM)         — отдельный baseline
+        PMCNetPaper (paper-faithful)           — общая БАЗА для четырёх
+          ├── PMCNetRadialCoil   (+ radial p(r))
+          ├── PMCNetSoftConstrained (+ Scheinker soft loss)
+          ├── PMCNetDebye        (+ обучаемая τ Debye)
+          └── PMCNetCentralFD    (+ central FD через Conv1d)
+
+    Каждая из четырёх веток включает РОВНО ОДНО улучшение, что даёт
+    чистую ablation: «насколько данное улучшение поднимает метрику
+    относительно paper-faithful базы».
     """
-    print("\n  PMCNet (Huang 2026) — четыре варианта (data-free)...")
+    print("\n  PMCNet (Huang 2026) — шесть вариантов (data-free) для ablation...")
     base = PMCNetConfig(
         image_size=tuple(image_shape),
         n_iterations=n_iterations,
         learning_rate=1e-3,
+        init_tau_seconds=init_tau_seconds,
     )
     n_meas = int(SM.shape[0])
     standard = PMCNetStandard(SM, image_shape, config=base)
-    paper = PMCNetPaper(image_shape, n_meas, config=base)
-    phys = PMCNetPhysicsEnhanced(image_shape, n_meas, config=base)
-    final_cfg = PMCNetConfig(**{
-        **base.__dict__,
-        'n_colors': n_colors, 'use_debye': True,
-        'init_tau_seconds': init_tau_seconds, 'lambda_tv': 1e-3,
-    })
-    final = PMCNetFinal(image_shape, n_meas,
-                        config=final_cfg, n_colors=n_colors)
-    print(f"    1) Standard          (SM-baseline — НЕ из paper)")
-    print(f"    2) Paper             (paper-faithful, Huang 2026 Eq. 1-3)")
-    print(f"    3) Physics-Enhanced  (paper + радиальная p, центр. FD, ...)")
-    print(f"    4) Final             (PhysicsEnhanced + Debye + multi-color + TV)")
-    return standard, paper, phys, final
+
+    # PMCNet-Paper: подгружаем реальные параметры сканера из H5, если дан путь.
+    # Эти параметры применяются КО ВСЕМ четырём наследникам — все они
+    # используют ту же физику, что и Paper.
+    paper_config = base
+    paper_freqs = None
+    paper_n_meas = n_meas
+    if scanner_h5_path is not None:
+        try:
+            scanner = _load_scanner_params_from_h5(scanner_h5_path)
+            paper_freqs = scanner.pop('frequencies_hz')
+            paper_config = PMCNetConfig(**{**base.__dict__, **scanner})
+            paper_n_meas = 2 * len(paper_freqs)
+            print(f"    [Paper] точные параметры из H5: "
+                  f"f_x={paper_config.drive_frequency_x:.0f} Hz, "
+                  f"f_y={paper_config.drive_frequency_y:.0f} Hz, "
+                  f"G_x={paper_config.gradient_strength:.2e}, "
+                  f"A_x={paper_config.drive_field_amplitude:.0f} A/m, "
+                  f"{len(paper_freqs)} частот для DFT")
+        except (FileNotFoundError, OSError) as e:
+            print(f"    [Paper] ⚠ не удалось прочитать {scanner_h5_path}: {e}")
+            print(f"    [Paper] используются config-дефолты")
+    paper = PMCNetPaper(image_shape, paper_n_meas, config=paper_config,
+                         frequencies_hz=paper_freqs)
+
+    # Четыре параллельных ветки — все используют paper_config и paper_freqs,
+    # отличаются только своим конкретным флагом-улучшением.
+    radial_coil = PMCNetRadialCoil(image_shape, paper_n_meas,
+                                    config=paper_config,
+                                    frequencies_hz=paper_freqs)
+    soft = PMCNetSoftConstrained(image_shape, paper_n_meas,
+                                  config=paper_config,
+                                  frequencies_hz=paper_freqs)
+    debye = PMCNetDebye(image_shape, paper_n_meas,
+                        config=paper_config,
+                        frequencies_hz=paper_freqs)
+    central_fd = PMCNetCentralFD(image_shape, paper_n_meas,
+                                  config=paper_config,
+                                  frequencies_hz=paper_freqs)
+
+    print(f"    1) Standard     (SM-baseline — НЕ из paper)")
+    print(f"    2) Paper [база] (paper-faithful, Huang 2026 Eq. 1-3)")
+    print(f"    3) RadialCoil   ← Paper + p(r) = 1/(1+(r/R)²)")
+    print(f"    4) Soft         ← Paper + Scheinker 2023 soft (‖∇c‖₂² + freq-weighted L1)")
+    print(f"    5) Debye        ← Paper + релаксация Дебая (обучаемая τ)")
+    print(f"    6) CentralFD    ← Paper + центральная FD через Conv1d (O(Δt²))")
+    return {
+        'standard': standard, 'paper': paper,
+        'radial_coil': radial_coil, 'soft': soft,
+        'debye': debye, 'central_fd': central_fd,
+    }
+
+
+# Backwards-compat alias — кто-то может импортировать старое имя
+build_pmcnet_quartet = build_pmcnet_variants
 
 
 
@@ -621,8 +639,9 @@ def build_pmcnet_quartet(SM, image_shape,
 
 def build_moe(comparator, image_shape,
               X_train, y_train,
-              expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)',
-                            'Shang(2022)', 'CNN'),
+              expert_names=('Тихонов', 'KatsMarc',
+                            'Chae(2017)', 'Chae-Multi(2017)',
+                            'CNN'),
               n_train_samples: int = 64,
               epochs: int = 30,
               mode: str = 'spatial'):
@@ -639,11 +658,33 @@ def build_moe(comparator, image_shape,
       4. Возвращаем готовый `MoEReconstructor`, чтобы подключить
          его в comparator.
 
-    PMCNet намеренно НЕ включён в дефолтный список экспертов: его
-    реконструкция требует ~1500 итераций оптимизации на одно
-    измерение, и прекомпьют по нескольким десяткам образцов получится
-    слишком долгим. Добавляйте `'PMCNet-Std(2026)'` и др. вручную,
-    если есть бюджет времени.
+    ## Критерий отбора экспертов в default-списке
+
+    В дефолт попали только модели, **быстрые на инференсе после
+    предобучения** (или вовсе не требующие обучения, как классические):
+
+      • Тихонов, KatsMarc — без обучения, итеративный inference 2-10 с;
+      • Chae(2017) Single + Multi — FC-сети, ~5 мс на инференс;
+      • CNN (U-Net) — ~10 мс.
+
+    НЕ в дефолте (по дизайну):
+
+      • **PMCNet × 4** — требуют 1500-3000 test-time-оптимизации,
+        прекомпьют 1500+ сэмплов сделает сборку MoE 10+ часов;
+      • **DIP(2020)** — test-time-обучение (3000 итераций с early stop),
+        4-8 с на сэмпл → прекомпьют 64 образцов ~5 минут (ещё допустимо),
+        но эта схема концептуально data-free, а MoE — supervised;
+      • **Diffusion** — DDPM-семпл 100 шагов = 13-18 с/сэмпл, прекомпьют
+        64 образцов ~15 минут. Можно добавить вручную: пройдёт в MoE,
+        но gating увидит этого эксперта как «медленный гладкий source»;
+      • **MoDL** — formально fast-after-pretraining (~50 мс), но
+        внутри уже содержит `(AᵀA+λI)⁻¹` data-consistency — то же, что
+        делает Tikhonov в MoE-наборе. На синтетических фантомах его
+        вклад сильно коррелирует с Tikhonov-экспертом → gating-сети
+        нечего разделять. Исключён, чтобы избежать избыточности.
+
+    Если хочется включить MoDL/PMCNet/DIP/Diffusion — передайте их в
+    `expert_names`. Имена совпадают с теми, что в таблице сравнения.
     """
     print("\n" + "=" * 70)
     print(f"2.5. MIXTURE OF EXPERTS — комбинирование ({len(expert_names)} экспертов)")
@@ -656,15 +697,16 @@ def build_moe(comparator, image_shape,
         'Тихонов': comparator.tikhonov_reconstruction,
         'KatsMarc': lambda m: comparator.katsmarc_reconstruction(m, n_iterations=10),
         'Chae(2017)': comparator.chae_reconstruction,
+        'Chae-Multi(2017)': comparator.chae_multi_reconstruction,
         'DIP(2020)': comparator.dip_reconstruction,
-        'Shang(2022)': comparator.shang_reconstruction,
-        'DEQ-MPI(2024)': comparator.deq_reconstruction,
         'CNN': comparator.cnn_reconstruction,
         'MoDL': comparator.modl_reconstruction,
         'Diffusion': comparator.diffusion_reconstruction,
         'PMCNet-Std(2026)': comparator.pmcnet_standard_reconstruction,
-        'PMCNet-Phys(2026)': comparator.pmcnet_physics_enhanced_reconstruction,
-        'PMCNet-Final(2026)': comparator.pmcnet_final_reconstruction,
+        'PMCNet-RadialCoil(2026)': comparator.pmcnet_radial_coil_reconstruction,
+        'PMCNet-Soft(2026)': comparator.pmcnet_soft_reconstruction,
+        'PMCNet-Debye(2026)': comparator.pmcnet_debye_reconstruction,
+        'PMCNet-CentralFD(2026)': comparator.pmcnet_central_fd_reconstruction,
     }
     experts = {}
     for n in expert_names:
@@ -731,30 +773,108 @@ def build_moe(comparator, image_shape,
 # ---------------------------------------------------------------------------
 
 
+def _load_scanner_params_from_h5(path: str) -> dict:
+    """Точные физические параметры сканера из H5 (MDF-формат).
+
+    Без этого PMCNet-Paper использует config-дефолты, которые могут
+    радикально не совпадать с реальным сканером. Для
+    BeihangUniversityData: config f_x=24510 Hz, а реальное f_x=10000 Hz
+    (2.5×); config f_y=26042 Hz, реальное f_y=1 Hz (4 порядка). При
+    таком несоответствии loss считается между разными физическими
+    объектами и Paper не может сойтись.
+
+    Эмпирически определённые единицы (Beihang sample):
+      • gradient stored as Т/м → конвертация в А/м/м делением на μ₀.
+      • drivefield/strength stored as mT → конвертация в А/м делением
+        на μ₀ × 10⁻³. С 10 mT и G=1.12 Т/м даёт FFP-амплитуду 8.93 мм,
+        что физически разумно (FOV±19 мм).
+
+    Returns:
+        dict с ключами для PMCNetConfig (drive_frequency_x/y,
+        gradient_strength/_y, drive_field_amplitude/_y) + отдельно
+        'frequencies_hz' (np.ndarray) — частоты для explicit DFT в
+        spectral-форварде.
+    """
+    import h5py
+    import math
+    mu0 = 4 * math.pi * 1e-7
+    with h5py.File(path, 'r') as f:
+        drive_freq = f['acquisition/drivefield/driveFrequency'][:].flatten()
+        gradient_T_per_m = f['acquisition/gradient'][:].flatten()
+        strength_mT = f['acquisition/drivefield/strength'][:].flatten()
+        freq_sel = f['measurement/frequencySelection'][:].flatten()
+    return {
+        'drive_frequency_x': float(drive_freq[0]),
+        'drive_frequency_y': float(max(drive_freq[1], 1.0)),
+        'gradient_strength': float(gradient_T_per_m[0] / mu0),
+        'gradient_strength_y': float(gradient_T_per_m[1] / mu0),
+        'drive_field_amplitude': float(strength_mT[0] * 1e-3 / mu0),
+        'drive_field_amplitude_y': float(strength_mT[1] * 1e-3 / mu0),
+        'frequencies_hz': freq_sel.astype(np.float32),
+    }
+
+
+def _load_real_measurement_b(
+        path: str = './../ChineseData/BeihangUniversityData/MeasurementData_B.h5'
+) -> np.ndarray:
+    """Загрузить РЕАЛЬНОЕ измерение фантома 'B' из BeihangUniversityData.
+
+    Файл MeasurementData_B.h5 — это MDF-формат с измеренным сигналом со
+    сканера (не изображение фантома). Содержит частотные гармоники в полях
+    `measurement/data/r` (real) и `measurement/data/i` (imaginary), форма
+    `(2, 1275)` — две катушки × 1275 гармоник, что точно совпадает с
+    SystemMatrix.h5.
+
+    Args:
+        path: путь к .h5 файлу. По умолчанию относительный от cwd `mpi/ML`.
+
+    Returns:
+        complex64 массив формы (2, M_per_coil), готовый к подаче
+        в `comparator.compare_all_methods_on_image` через поле
+        `measurement` battery-словаря.
+    """
+    import h5py
+    with h5py.File(path, 'r') as f:
+        re = f['measurement/data/r'][:]            # (2, 1275) float64
+        im = f['measurement/data/i'][:]
+        if int(f['measurement/isFourierTransformed'][:].item()) != 1:
+            raise ValueError(
+                f"{path}: measurement не в частотной области "
+                "(isFourierTransformed != 1)"
+            )
+    measurement = (re + 1j * im).astype(np.complex64)
+    return measurement
+
+
 def build_phantom_battery(SM_measured, image_shape,
                           snr_db: float = 30.0,
                           random_seed: int = 0):
     """Сгенерировать батарею фантомов × методов для финального сравнения.
 
-    Включены 6 типов 2D-фантомов:
+    Включены 5 синтетических 2D-фантомов + 1 реальное измерение:
       • two_droplets — две капли (классический тест разрешения);
       • phantom_4    — четыре угловые капли;
       • rotation_45  — крест с маркерами, повёрнутый на 45°;
       • shape_ring   — кольцевой фантом;
       • random       — случайные капли;
-      • letter_B     — стилизованная буква B (приближение к
-                       MeasurementData_B.h5 из BeihangUniversityData).
+      • letter_B     — РЕАЛЬНОЕ измерение фантома 'B' из
+                       BeihangUniversityData/MeasurementData_B.h5
+                       (сигнал со сканера, не синтез).
 
-    Для каждого фантома измерения генерируются ДВУМЯ путями (как в
-    статье Chae 2017):
+    Для 5 синтетических фантомов измерения генерируются ДВУМЯ путями:
       • method='sm'      — через ИЗМЕРЕННУЮ системную матрицу (реальная
                             калибровка сканера);
       • method='physical' — через АНАЛИТИЧЕСКУЮ системную матрицу,
                             вычисленную из физики (Langevin + радиальная
-                            s(r) + Лиссажу). Имеет ту же форму, что и
-                            измеренная — все модели работают одинаково.
+                            s(r) + Лиссажу).
 
-    Итого 6 × 2 = 12 экспериментов.
+    Для letter_B — ОДНО измерение (реальное со сканера), без синтеза.
+    Ground-truth изображение для метрик — приближение через
+    `PhantomGenerator.letter_phantom('B')` (стандартная практика для
+    real-data валидации, когда точная форма фантома известна по дизайну,
+    но прямая запись изображения с прибора недоступна).
+
+    Итого 5×2 + 1 = 11 экспериментов.
 
     Returns:
         list[dict]: каждый элемент — {'label', 'image', 'measurement',
@@ -767,14 +887,13 @@ def build_phantom_battery(SM_measured, image_shape,
     np.random.seed(random_seed)
     pg = PhantomGenerator(nx=image_shape[0], ny=image_shape[1])
 
-    # 6 типов фантомов (ground truth)
-    phantoms = [
+    # 5 синтетических фантомов (с двумя путями генерации измерений)
+    synthetic_phantoms = [
         ('two_droplets', pg.two_droplets(radius=0.2, distance=0.2)),
         ('phantom_4',    pg.phantom_4()),
         ('rotation_45',  pg.rotation_phantom(angle_deg=45.0)),
         ('shape_ring',   pg.shape_phantom('ring')),
         ('random',       pg.random_phantom(n_droplets=5)),
-        ('letter_B',     pg.letter_phantom('B')),
     ]
 
     # Аналитическая SM той же формы, что измеренная
@@ -783,9 +902,9 @@ def build_phantom_battery(SM_measured, image_shape,
     cfg_phys = PMCNetConfig(image_size=tuple(image_shape))
     SM_analytical = build_analytical_system_matrix(image_shape, M_total, cfg_phys)
 
-    # Для каждого фантома — два измерения (sm + physical)
+    # Для каждого синтетического фантома — два измерения (sm + physical)
     battery = []
-    for phantom_name, image in phantoms:
+    for phantom_name, image in synthetic_phantoms:
         for method_name, SM_used in (('sm', SM_measured),
                                       ('physical', SM_analytical)):
             label = f'{phantom_name}__{method_name}'
@@ -801,8 +920,37 @@ def build_phantom_battery(SM_measured, image_shape,
                              'generation_method': method_name},
             })
 
+    # letter_B — реальное измерение из H5, ground truth через приближение
+    print(f"  Загрузка реального измерения фантома 'B' из H5...")
+    try:
+        real_b_meas = _load_real_measurement_b()
+        # Ground truth для метрик: приближённое изображение по дизайну
+        # фантома (точная форма B известна, но изображения со сканера нет)
+        gt_b_approx = pg.letter_phantom('B')
+        # Согласование размерностей measurement и SM: H5-файл может иметь
+        # больше частотных бинов, чем SM_measured (1275 vs M_total/2).
+        M_per_coil = M_total // 2
+        if real_b_meas.shape[1] != M_per_coil:
+            # Берём первые M_per_coil гармоник (низкочастотные несут основную
+            # энергию реконструкции; высокие частоты вне SM-сетки не нужны)
+            real_b_meas = real_b_meas[:, :M_per_coil]
+            print(f"    обрезано до {M_per_coil} гармоник на катушку, "
+                  f"чтобы совпало с SM_measured ({M_total} полных бинов)")
+        battery.append({
+            'label': 'letter_B__real',
+            'image': gt_b_approx,            # ground truth approx для SSIM
+            'measurement': real_b_meas,       # РЕАЛЬНОЕ измерение со сканера
+            'metadata': {'phantom_type': 'letter_B',
+                         'generation_method': 'real'},
+        })
+        print(f"    letter_B измерение: {real_b_meas.shape} complex64 (со сканера)")
+    except (FileNotFoundError, OSError) as e:
+        print(f"  ⚠ Не удалось загрузить MeasurementData_B.h5: {e}")
+        print(f"    letter_B пропущен (только синтетические фантомы)")
+
     print(f"  Готово: {len(battery)} экспериментов "
-          f"({len(phantoms)} фантомов × 2 метода)")
+          f"({len(synthetic_phantoms)} синтетических × 2 пути "
+          f"+ letter_B на реальном сигнале)")
     return battery
 
 
@@ -836,15 +984,33 @@ def run_openmpi_validation(comparator):
 
 def run_pipeline(num_samples: int = 2000, train_models: bool = True,
                  pmcnet_iterations: int = 1500,
-                 validate_openmpi: bool = False):
-    """End-to-end вызов всего пайплайна."""
+                 validate_openmpi: bool = False,
+                 force_regenerate_dataset: bool = False):
+    """End-to-end вызов всего пайплайна.
+
+    Args:
+        num_samples: размер обучающего синтетического датасета (SM-путь).
+        train_models: обучать ли supervised-модели заново или загружать
+                      сохранённые веса из DATA/models/.
+        pmcnet_iterations: число итераций для data-free методов (PMCNet, DIP).
+        validate_openmpi: запускать ли валидацию на OpenMPIData (нужны
+                          локальные файлы в ChineseData/OpenMPIData/).
+        force_regenerate_dataset: если True, сгенерировать синтетический
+                                   датасет заново даже если он сохранён
+                                   на диске. По умолчанию False — при
+                                   повторных запусках датасет загружается
+                                   с диска мгновенно.
+    """
     print("=" * 70)
     print("PIPELINE: сравнение методов реконструкции MPI")
     print("=" * 70)
     setup_directories()
 
-    # 1) синтетический датасет (оба пути из Chae 2017)
-    _, dataset_sm = generate_synthetic_dataset(num_samples=num_samples, save=True)
+    # 1) синтетический датасет — load with cache or generate-and-save
+    _, dataset_sm = generate_synthetic_dataset(
+        num_samples=num_samples, save=True,
+        force_regenerate=force_regenerate_dataset,
+    )
 
     # Загрузка измеренной SM из BeihangUniversityData
     gen = MPIDatasetGenerator()
@@ -854,7 +1020,7 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
 
     # Синтетический генератор фантомов работает в (51, 51), а измеренная
     # SM рассчитана на (image_shape) — обычно (19, 19). Перенесём фантомы
-    # на сетку SM, чтобы у CNN/MoDL/DEQ совпадали размеры.
+    # на сетку SM, чтобы у CNN/MoDL совпадали размеры.
     y_synth = dataset_sm['y_train']
     if y_synth.shape[1:] != tuple(image_shape):
         from scipy.ndimage import zoom
@@ -885,16 +1051,12 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     chae_single, chae_multi = train_or_load_chae(
         SM, image_shape, X_train, y_train, train=train_models)
     dip = build_dip(image_shape)
-    # Shang FDS-MPI временно отключён — Tikhonov-препроцессинг на
-    # каждый X_train занимает ~3 с/семпл (на 3000 семплов = 2.5 часа
-    # ДО старта тренировки сети). См. `train_or_load_shang` — там
-    # дефолты уже уменьшены (epochs=10, kmax=5, max_train_samples=300).
-    # Раскомментируйте обе строки ниже, чтобы включить обратно.
-    # shang = train_or_load_shang(X_train, y_train, SM, train=train_models)
-    shang = None
-    deq = train_or_load_deq(SM, image_shape, X_train, y_train, train=train_models)
-    pmcnet_std, pmcnet_paper, pmcnet_phys, pmcnet_final = build_pmcnet_quartet(
-        SM, image_shape, n_iterations=pmcnet_iterations, n_colors=2,
+    pmcnet_variants = build_pmcnet_variants(
+        SM, image_shape, n_iterations=pmcnet_iterations,
+        # Подгружаем точные параметры сканера из H5 — устраняет огромное
+        # расхождение config-дефолтов с реальной физикой сканера
+        # (f_x: 24510 → 10000, f_y: 26042 → 1, G_x: 0.56 → 1.12 Т/м, ...)
+        scanner_h5_path='./../ChineseData/BeihangUniversityData/SystemMatrix.h5',
     )
 
     # 3) Сравнение через comparator
@@ -904,14 +1066,14 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
     cmp.set_modl_model(modl)
     cmp.set_diffusion_model(diff)
     cmp.set_chae_model(chae_single)
+    cmp.set_chae_multi_model(chae_multi)
     cmp.set_dip_model(dip)
-    if shang is not None:
-        cmp.set_shang_model(shang)
-    cmp.set_deq_model(deq)
-    cmp.set_pmcnet_standard(pmcnet_std)
-    cmp.set_pmcnet_paper(pmcnet_paper)
-    cmp.set_pmcnet_physics_enhanced(pmcnet_phys)
-    cmp.set_pmcnet_final(pmcnet_final)
+    cmp.set_pmcnet_standard(pmcnet_variants['standard'])
+    cmp.set_pmcnet_paper(pmcnet_variants['paper'])
+    cmp.set_pmcnet_radial_coil(pmcnet_variants['radial_coil'])
+    cmp.set_pmcnet_soft(pmcnet_variants['soft'])
+    cmp.set_pmcnet_debye(pmcnet_variants['debye'])
+    cmp.set_pmcnet_central_fd(pmcnet_variants['central_fd'])
 
     # 2.4) Cross-validation параметра μ для Tikhonov на этом наборе
     best_mu = tune_tikhonov_mu(SM, X_train, y_train,
@@ -919,15 +1081,12 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
                                 kmax=20, n_val_samples=12)
     cmp.set_tikhonov_mu(best_mu)
 
-    # 2.5) MoE поверх быстрых экспертов (Shang исключён — отключён выше)
-    moe_experts = ['Тихонов', 'KatsMarc', 'Chae(2017)', 'CNN']
-    if shang is not None:
-        moe_experts.insert(3, 'Shang(2022)')
+    # 2.5) MoE поверх быстрых экспертов
     moe = build_moe(
         comparator=cmp,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
-        expert_names=tuple(moe_experts),
+        expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'CNN'),
         n_train_samples=128,
         epochs=80,
         mode='spatial',

@@ -1,5 +1,58 @@
-"""Сравнение методов реконструкции MPI:
-Tikhonov / Kaczmarz / Chae / DIP / Shang / DEQ-MPI / CNN / MoDL / Diffusion / PMCNet-trio.
+"""Унифицированное сравнение методов реконструкции MPI.
+
+## Что делает
+
+`MPIReconstructionComparator` принимает на вход:
+  • Системную матрицу сканера (из калибровочного H5);
+  • Любой набор моделей реконструкции через сеттеры (`set_cnn_model`,
+    `set_dip_model`, и т. д.);
+
+и предоставляет:
+  • Унифицированный метод `compare_all_methods_on_image(image, measurement)`,
+    который прогоняет ВСЕ зарегистрированные методы и собирает метрики
+    в единую таблицу;
+  • Метод `run_phantom_battery(battery)` для пакетной обработки
+    нескольких фантомов;
+  • Сводные функции `print_summary_table()`, `save_results_to_file()`,
+    `_visualize_all_comparison()` для отчётов.
+
+## Поддерживаемые методы
+
+  Классические:
+    • Tikhonov (создаётся автоматически из переданной SM);
+    • Kaczmarz/ART (то же).
+
+  Регистрируемые через сеттеры (опциональные):
+    • set_cnn_model(trainer)        — CNN baseline;
+    • set_modl_model(trainer)       — Model-based Deep Learning;
+    • set_diffusion_model(trainer)  — DDPM baseline;
+    • set_chae_model(model)         — Chae 2017 single-layer FC;
+    • set_dip_model(model)          — Deep Image Prior;
+    • set_pmcnet_standard(...)      — PMCNet с измеренной SM;
+    • set_pmcnet_paper(...)         — PMCNet paper-faithful;
+    • set_pmcnet_radial_coil(...) — + физические улучшения;
+    • set_pmcnet_soft(...)          — Phys + soft constraints (Scheinker 2023);
+    • set_pmcnet_debye(...)         — Phys + Debye-релаксация (обучаемая τ);
+    • set_pmcnet_central_fd(...)    — Phys + центральная FD через Conv1d;
+    • set_moe(moe)                  — Mixture of Experts.
+
+  Метод, не зарегистрированный через сеттер, автоматически пропускается
+  и помечается «ПРОПУЩЕН» в таблице.
+
+## Унификация форматов
+
+Все методы внутри принимают measurement как complex (2, M/2) и
+возвращают reconstruction как (Nx, Ny) float. Compatator скрывает
+конверсии между разными внутренними форматами моделей.
+
+## Метрики
+
+  • **SSIM** — structural similarity (визуальное качество структур);
+  • **PSNR** — peak signal-to-noise ratio (общее качество в dB);
+  • **FWHM** — full width at half maximum точечной функции рассеяния
+    (мера разрешения);
+  • **time** — секунды на реконструкцию (для оценки practical
+    применимости).
 """
 
 import numpy as np
@@ -28,14 +81,15 @@ class MPIReconstructionComparator:
 
         # Модели по статьям
         self.chae_model = None
+        self.chae_multi_model = None  # Chae 2017 multi-layer вариант
         self.dip_model = None
-        self.shang_model = None
-        self.deq_model = None
         # PMCNet (Huang et al., 2026) — три варианта в одной системе координат
         self.pmcnet_standard = None                    # 1) измеренная SM (baseline)
         self.pmcnet_paper = None                       # 2) paper-faithful (Huang 2026 Eq. 1-3)
-        self.pmcnet_physics_enhanced = None            # 3) paper + physical улучшения
-        self.pmcnet_final = None                       # 4) PhysicsEnhanced + Debye + multi-color + TV
+        self.pmcnet_radial_coil = None            # 3) paper + physical улучшения
+        self.pmcnet_soft = None                        # 4) Phys + Scheinker 2023 soft constraints
+        self.pmcnet_debye = None                       # 5) Phys + только Debye-релаксация
+        self.pmcnet_central_fd = None                  # 6) Phys + только центральная FD + TV
 
         # Mixture of Experts поверх остальных методов
         self.moe = None
@@ -91,20 +145,21 @@ class MPIReconstructionComparator:
         self.diffusion_trainer = diffusion_trainer
 
     def set_chae_model(self, chae_model):
-        """Установка модели Chae (2017)"""
+        """Установка модели Chae (2017) — однослойный вариант."""
         self.chae_model = chae_model
+
+    def set_chae_multi_model(self, chae_multi_model):
+        """Установка модели Chae (2017) — двухслойный (multi-layer) вариант.
+
+        Согласно Sec. III.3 статьи: hidden layer даёт двухпорядковое
+        улучшение MSE на частицах <40 нм. В нашем сетапе они выступают
+        как самостоятельные эксперты в MoE.
+        """
+        self.chae_multi_model = chae_multi_model
 
     def set_dip_model(self, dip_model):
         """Установка модели Deep Image Prior (Dittmer et al., 2020)"""
         self.dip_model = dip_model
-
-    def set_shang_model(self, shang_model):
-        """Установка модели Shang et al. (2020)"""
-        self.shang_model = shang_model
-
-    def set_deq_model(self, deq_model):
-        """Установка модели DEQ-MPI (Güngör et al., 2024)"""
-        self.deq_model = deq_model
 
     def set_pmcnet_standard(self, reconstructor):
         """Вариант 1 — PMCNet-Standard (SM-baseline, _не_ из paper).
@@ -125,23 +180,42 @@ class MPIReconstructionComparator:
         """
         self.pmcnet_paper = reconstructor
 
-    def set_pmcnet_physics_enhanced(self, reconstructor):
-        """Вариант 3 — PMCNet-PhysicsEnhanced (paper-base + physical улучшения).
+    def set_pmcnet_radial_coil(self, reconstructor):
+        """Вариант 3 — PMCNet-RadialCoil (Paper + ОДНО улучшение).
 
-        База — paper-faithful, поверх неё: радиальная p(r), стабильный
-        Langevin, центральная разность через Conv1d (в духе Maxwell-PCNN).
-        Без NN-довесков — single color, без Дебая, без TV.
+        Заменяет uniform p(r) ≡ 1 на радиальную чувствительность катушки
+        p(r) = 1/(1+(r/R)²). Никаких других изменений относительно
+        PMCNet-Paper. Параллельная ветка к Soft, Debye, CentralFD.
         """
-        self.pmcnet_physics_enhanced = reconstructor
+        self.pmcnet_radial_coil = reconstructor
 
-    def set_pmcnet_final(self, reconstructor):
-        """Вариант 4 — PMCNet-Final (PhysicsEnhanced + Debye + multi-color + TV).
+    def set_pmcnet_soft(self, reconstructor):
+        """Вариант 4 — PMCNet-Soft (Phys + soft constraints, Scheinker 2023).
 
-        Самая полная версия: physics improvements + paper Eq. 4-5 (Debye)
-        + paper Sec. III (multi-color, обучаемая τ_k через softplus)
-        + TV-регуляризация (наше).
+        Добавляет к Phys ТОЛЬКО мягкие auxiliary loss'ы — L2-штраф на ∇c
+        (Scheinker Eq. 12-13) и частотно-взвешенный L1 на u. Без обучаемой
+        τ и multi-color. Изолирует вклад PINN-style soft constraints.
         """
-        self.pmcnet_final = reconstructor
+        self.pmcnet_soft = reconstructor
+
+    def set_pmcnet_debye(self, reconstructor):
+        """Вариант 5 — PMCNet-Debye (Phys + только Debye-релаксация).
+
+        Добавляет к Phys ТОЛЬКО релаксацию Дебая (paper Eq. 4-5) с
+        обучаемой τ через softplus. Без multi-color, TV, soft-constraints,
+        central FD. Изолирует вклад модели инерции намагниченности частиц.
+        """
+        self.pmcnet_debye = reconstructor
+
+    def set_pmcnet_central_fd(self, reconstructor):
+        """Вариант 6 — PMCNet-CentralFD (Phys + только центральная FD).
+
+        Добавляет к Phys ТОЛЬКО более точную дискретизацию ∂M/∂t через
+        Conv1d с фиксированным ядром [−1, 0, +1]/(2Δt) — точность O(Δt²)
+        вместо O(Δt) у forward-FD в Phys. Изолирует эффект схемы
+        дискретизации производной (Maxwell-PCNN Eq. 12-13).
+        """
+        self.pmcnet_central_fd = reconstructor
 
     def set_moe(self, moe):
         """Установить Mixture of Experts поверх остальных методов.
@@ -217,49 +291,76 @@ class MPIReconstructionComparator:
         except (StopIteration, AttributeError):
             return torch.device('cpu')
 
-    def chae_reconstruction(self, measurement):
-        """Реконструкция методом Chae (2017) с батчевой обработкой"""
-        if self.chae_model is None:
-            raise ValueError("Chae модель не установлена")
+    def _chae_inference(self, model, measurement):
+        """Общий код инференса для Chae single/multi.
 
-        # Подготовка входных данных
-        real_part = measurement.real  # (2, n_measurements)
-        imag_part = measurement.imag  # (2, n_measurements)
+        Препроцессинг согласован с обучением (см. pipeline._flatten_measurement_batch):
+          1. Амплитудный спектр |u| по обеим катушкам (paper Sec. III.1);
+          2. Конкатенация в плоский вектор длины 2·M_per_coil;
+          3. Per-sample max-нормировка → значения в [0, 1] под сигмоид.
 
-        # Формирование вектора как при обучении
-        meas_vector = np.concatenate([
-            real_part[0, :],  # real катушка 1
-            imag_part[0, :],  # imag катушка 1
-            real_part[1, :],  # real катушка 2
-            imag_part[1, :]  # imag катушка 2
-        ])
+        Re/Im разложение не используется — Chae-веса не сходятся к
+        Чебышёв-полиномам на нём.
+        """
+        # Амплитудный спектр + per-sample max-нормировка (как в pipeline)
+        abs_spec = np.abs(measurement).astype(np.float32)
+        meas_vector = abs_spec.flatten()
+        max_val = float(meas_vector.max())
+        if max_val > 0:
+            meas_vector = meas_vector / max_val
 
-        # Нормализация если есть scaler
-        if hasattr(self.chae_model, 'scaler_mean'):
-            meas_vector = (meas_vector - self.chae_model.scaler_mean) / self.chae_model.scaler_scale
-
-        # Предсказание (на device модели)
-        dev = self._model_device(self.chae_model)
+        dev = self._model_device(model)
         meas_tensor = torch.tensor(meas_vector, dtype=torch.float32,
                                    device=dev)
 
-        self.chae_model.eval()
+        model.eval()
         with torch.no_grad():
-            reconstructed_flat = self.chae_model(meas_tensor.unsqueeze(0))
+            reconstructed_flat = model(meas_tensor.unsqueeze(0))
 
         reconstructed = reconstructed_flat.cpu().numpy().reshape(self.image_shape)
 
-        # Постобработка
+        # Финальная нормализация для согласования с метриками SSIM/PSNR
+        # (target y_train также был нормирован на max во время обучения).
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
-
         return reconstructed
+
+    def chae_reconstruction(self, measurement):
+        """Реконструкция Chae (2017) — однослойный вариант."""
+        if self.chae_model is None:
+            raise ValueError("Chae модель не установлена")
+        return self._chae_inference(self.chae_model, measurement)
+
+    def chae_multi_reconstruction(self, measurement):
+        """Реконструкция Chae (2017) — двухслойный (multi-layer) вариант.
+
+        Та же логика препроцессинга, что у single — отличаются только
+        веса модели. См. Sec. III.3 paper про преимущество multi-layer.
+        """
+        if self.chae_multi_model is None:
+            raise ValueError("Chae-multi модель не установлена")
+        return self._chae_inference(self.chae_multi_model, measurement)
 
     # ====================================================================
     # МЕТОД 2: Dittmer et al. (2020) - Deep Image Prior (DIP)
     # ====================================================================
-    def dip_reconstruction(self, measurement, n_iterations=500):
-        """Полноценная реконструкция Deep Image Prior"""
+    def dip_reconstruction(self, measurement, n_iterations=3000,
+                            patience: int = 250):
+        """Реконструкция Deep Image Prior c early stopping и фикс. z.
+
+        Изменения относительно прежней версии (соответствие Dittmer 2020):
+          • **Фиксированный z**: убрано `latent_z.requires_grad=True` —
+            paper явно фиксирует вход (Sec. II.C), trainable z ломает
+            spectral-bias регуляризацию DIP.
+          • **Early stopping**: трекаем running-min loss; если за
+            `patience` итераций нет улучшения — останавливаемся и
+            возвращаем `best_x`. Paper Sec. IV: успех DIP именно
+            благодаря выбору момента остановки.
+          • **lr=1e-3** (было 0.01) — Adam с lr=0.01 на DIP-генераторе
+            типично взрывается за 200 итераций.
+          • **n_iterations=3000** дефолт (было 500) — даёт early
+            stopping шанс отработать на сложных фантомах.
+        """
         if self.dip_model is None:
             raise ValueError("DIP модель не установлена")
 
@@ -289,43 +390,54 @@ class MPIReconstructionComparator:
             setattr(self, cache_key, A_tensor.T)
         self.A_tensor_T = getattr(self, cache_key)
 
-        # Оптимизатор
-        optimizer = optim.Adam(dip_model.parameters(), lr=0.01)
+        # Оптимизатор — только веса сети
+        optimizer = optim.Adam(dip_model.parameters(), lr=1e-3)
 
-        # Латентный вектор на нужном device
+        # Латент: ФИКСИРОВАННЫЙ (no gradient) — paper Dittmer 2020 Sec. II.C.
+        # Прежнее requires_grad=True позволяло сети «жульничать» через z,
+        # обходя architecture-induced регуляризацию.
         latent_z = dip_model.generate_random_latent().to(dev)
-        latent_z.requires_grad = True
+        # latent_z.requires_grad остаётся False по умолчанию
 
-        # Оптимизация
-        print(f"  Оптимизация DIP (до {n_iterations} итераций)...")
+        # Early-stopping state
+        best_loss = float('inf')
+        best_x = None
+        no_improve = 0
+
+        print(f"  Оптимизация DIP (до {n_iterations} итераций, "
+              f"patience={patience})...")
         for iteration in range(n_iterations):
             optimizer.zero_grad()
 
-            # Генерация изображения
             generated_image = dip_model(latent_z)
             generated_flat = generated_image.view(1, -1)
-
-            # Прямой оператор
             measurement_pred = generated_flat @ self.A_tensor_T
 
-            # Loss: L1 на сигнал — статья Dittmer 2020 (Sec. II.C) явно
-            # рекомендует p=1, а не p=2: "throughout this paper we will
-            # use p = 1". L1 устойчивее на негауссовом шуме MPI и в
-            # сочетании с авто-регуляризацией DIP-архитектуры (без skip)
-            # даёт лучший PSNR/SSIM. TV-регуляризацию НЕ добавляем —
-            # статья опирается ИСКЛЮЧИТЕЛЬНО на implicit regularization
-            # от архитектуры (раздел II.C, заключение).
+            # L1-loss согласно paper Sec. II.C ("we use p = 1").
             loss = torch.mean(torch.abs(measurement_pred - meas_tensor))
             loss.backward()
             optimizer.step()
 
-            if iteration % 100 == 0:
-                print(f"    DIP iteration {iteration}, loss: {loss.item():.6f}")
+            cur = loss.item()
+            if cur < best_loss * 0.999:  # требуем заметного улучшения
+                best_loss = cur
+                best_x = generated_image.detach().clone()
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    print(f"    Early stop @ iter {iteration} "
+                          f"(no improve for {patience}), best_loss={best_loss:.6f}")
+                    break
 
-        # Финальная реконструкция
-        dip_model.eval()
-        with torch.no_grad():
-            reconstructed = dip_model(latent_z)[0, 0].cpu().numpy()
+            if iteration % 200 == 0:
+                print(f"    DIP iter {iteration}, loss: {cur:.6f}, "
+                      f"best: {best_loss:.6f}")
+
+        # Возвращаем лучший snapshot, а не финал
+        if best_x is None:
+            best_x = generated_image.detach()
+        reconstructed = best_x[0, 0].cpu().numpy()
 
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
@@ -341,64 +453,7 @@ class MPIReconstructionComparator:
         return reconstructed
 
     # ====================================================================
-    # МЕТОД 3: Shang et al. (2020) - CNN для улучшения разрешения
-    # ====================================================================
-    def shang_reconstruction(self, measurement):
-        """Реконструкция методом Shang et al. (2020)"""
-        if self.shang_model is None:
-            raise ValueError("Shang модель не установлена")
-
-        # FDS-MPI ждёт LOW-RES изображение на входе. Используем Tikhonov
-        # (тот же преобразователь, на котором обучалась сеть), а не
-        # сырое псевдо-обращение — иначе шум полностью «забивает» вход
-        # и сеть учит mapping шум→GT.
-        meas_vector = np.concatenate([measurement[0, :], measurement[1, :]])
-        try:
-            initial_recon = self.tikhonov_reconstructor.reconstruct(
-                meas_vector, mu=1e-2, kmax=15).reshape(self.image_shape)
-        except Exception:
-            initial_recon = np.zeros(self.image_shape, dtype=np.float32)
-        initial_recon = initial_recon.astype(np.float32)
-
-        dev = self._model_device(self.shang_model)
-        input_tensor = torch.tensor(initial_recon, dtype=torch.float32,
-                                    device=dev).unsqueeze(0).unsqueeze(0)
-
-        self.shang_model.eval()
-        with torch.no_grad():
-            reconstructed = self.shang_model(input_tensor)[0, 0].cpu().numpy()
-
-        if reconstructed.max() > 0:
-            reconstructed = reconstructed / reconstructed.max()
-
-        return reconstructed
-
-    # ====================================================================
-    # МЕТОД 4: Güngör et al. (2024) - DEQ-MPI
-    # ====================================================================
-    def deq_reconstruction(self, measurement):
-        """Реконструкция методом DEQ-MPI (Güngör et al., 2024)"""
-        if self.deq_model is None:
-            raise ValueError("DEQ-MPI модель не установлена")
-
-        real_part = measurement.real
-        imag_part = measurement.imag
-        meas_vector = np.concatenate([real_part.flatten(), imag_part.flatten()])
-        dev = self._model_device(self.deq_model)
-        meas_tensor = torch.tensor(meas_vector, dtype=torch.float32,
-                                   device=dev).unsqueeze(0)
-
-        self.deq_model.eval()
-        with torch.no_grad():
-            reconstructed = self.deq_model(meas_tensor)[0, 0].cpu().numpy()
-
-        if reconstructed.max() > 0:
-            reconstructed = reconstructed / reconstructed.max()
-
-        return reconstructed
-
-    # ====================================================================
-    # МЕТОД 5.5: Huang et al. (2026) - PMCNet (Physical Model-Constrained Net)
+    # МЕТОД 3: Huang et al. (2026) - PMCNet (Physical Model-Constrained Net)
     # ====================================================================
     def _measurement_to_complex_vector(self, measurement):
         """Стандартный путь: measurement формы (2, n_freq) → комплексный вектор (M,)
@@ -451,51 +506,104 @@ class MPIReconstructionComparator:
         )
         return self._postprocess_recon(recon)
 
-    # -- Вариант 3: PMCNet-Physics-Enhanced (paper + physical улучшения) ------
-    def pmcnet_physics_enhanced_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-Physics-Enhanced: u = S_analytical · c, без NN-улучшений.
+    # -- Вариант 3: PMCNet-RadialCoil (Paper + только radial p(r)) ------------
+    def pmcnet_radial_coil_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-RadialCoil: Paper + ОДНО улучшение — радиальная p(r).
 
-        Системная матрица собрана из стабильного Langevin, радиальной
-        чувствительности s(r), траектории Лиссажу и центральной разности
-        через фиксированную свёртку. Architecture identical to Standard.
+        Заменяет uniform p(r) ≡ 1 на физически реалистичный профиль
+        p(r) = 1/(1+(|r|/R_coil)²). Всё остальное — paper-faithful.
+        Параллельная ветка Soft / Debye / CentralFD.
         """
-        if self.pmcnet_physics_enhanced is None:
-            raise ValueError("PMCNet-Physics-Enhanced модель не установлена")
+        if self.pmcnet_radial_coil is None:
+            raise ValueError("PMCNet-RadialCoil модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
-        recon = self.pmcnet_physics_enhanced.reconstruct(
+        recon = self.pmcnet_radial_coil.reconstruct(
             u_complex, n_iterations=n_iterations, verbose=False,
         )
         return self._postprocess_recon(recon)
 
-    # -- Вариант 3: PMCNet-Final (физика + все NN-улучшения) -----------------
-    def pmcnet_final_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-Final: аналитическая SM + Debye + multi-color + TV.
+    # -- Вариант 4: PMCNet-Soft (Paper + Scheinker soft constraints) ----------
+    def pmcnet_soft_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-Soft: Paper + ОДНО улучшение — Scheinker 2023 soft loss.
 
-        Оцененные τ_k сохраняются в `self.last_pmcnet_taus_seconds`
-        для отчёта; для multi-color карты концентраций суммируются по
-        цветовым каналам.
+        Forward тот же, что у PMCNet-Paper (uniform p(r), forward-FD).
+        В loss добавлены два auxiliary штрафа:
+          • λ_grad · ‖∇c‖₂² (Scheinker 2023, Eq. 12-13);
+          • frequency-weighted L1 на u_real/u_imag.
+
+        Никаких изменений в forward-операторе.
         """
-        if self.pmcnet_final is None:
-            raise ValueError("PMCNet-Final модель не установлена")
+        if self.pmcnet_soft is None:
+            raise ValueError("PMCNet-Soft модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
-        c_np, taus = self.pmcnet_final.reconstruct(
+        recon = self.pmcnet_soft.reconstruct(
             u_complex, n_iterations=n_iterations, verbose=False,
         )
-        self.last_pmcnet_taus_seconds = taus
-        recon = c_np.sum(axis=0) if c_np.ndim == 3 else c_np
+        return self._postprocess_recon(recon)
+
+    # -- Вариант 5: PMCNet-Debye (Phys + только Debye-релаксация) -------------
+    def pmcnet_debye_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-Debye: Phys + обучаемая Debye-релаксация (без multi-color, без TV).
+
+        Оценённое τ доступно через `self.pmcnet_debye.network.debye.tau_seconds`
+        для отчёта (в отличие от прежнего PMCNet-Final, где τ возвращалось
+        вторым элементом кортежа — теперь reconstruct() даёт чистый image).
+        """
+        if self.pmcnet_debye is None:
+            raise ValueError("PMCNet-Debye модель не установлена")
+        u_complex = self._measurement_to_complex_vector(measurement)
+        recon = self.pmcnet_debye.reconstruct(
+            u_complex, n_iterations=n_iterations, verbose=False,
+        )
+        # Сохраним τ для отчёта (single-color → один скаляр)
+        try:
+            self.last_pmcnet_taus_seconds = (
+                self.pmcnet_debye.network.debye.tau_seconds
+                .detach().cpu().numpy()
+            )
+        except AttributeError:
+            self.last_pmcnet_taus_seconds = None
+        return self._postprocess_recon(recon)
+
+    # -- Вариант 6: PMCNet-CentralFD (Phys + только central FD) ---------------
+    def pmcnet_central_fd_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-CentralFD: Phys + центральная разность через Conv1d.
+
+        Всё то же, что у PhysicsEnhanced, но с точностью O(Δt²) у
+        производной ∂M/∂t. Симметричное ядро [−1, 0, +1]/(2Δt) реализовано
+        фиксированным Conv1d без обучаемых весов.
+        """
+        if self.pmcnet_central_fd is None:
+            raise ValueError("PMCNet-CentralFD модель не установлена")
+        u_complex = self._measurement_to_complex_vector(measurement)
+        recon = self.pmcnet_central_fd.reconstruct(
+            u_complex, n_iterations=n_iterations, verbose=False,
+        )
         return self._postprocess_recon(recon)
 
     # ====================================================================
     # МЕТОД 6: KatsMarc (Алгоритм Кацмарца, 1937)
     # ====================================================================
-    def katsmarc_reconstruction(self, measurement, n_iterations=20, relaxation=1.0):
-        """Реконструкция алгоритмом Кацмарца (Kaczmarz, 1937)"""
+    def katsmarc_reconstruction(self, measurement, n_iterations=None,
+                                 relaxation=None):
+        """Реконструкция алгоритмом Кацмарца (Kaczmarz, 1937).
+
+        Параметры по умолчанию задаются в `KatsMarcAlgorithm.reconstruct`
+        (n_iterations=20, relaxation=0.3, damp_schedule=False) — они
+        откалиброваны под globally-normalised rows. Здесь None означает
+        «использовать дефолты алгоритма».
+        """
         if self.katsmarc is None:
             print("  KatsMarc алгоритм не инициализирован")
             return None
 
         meas_vector = np.concatenate([measurement[0, :], measurement[1, :]])
-        reconstructed = self.katsmarc.reconstruct(meas_vector, n_iterations, relaxation)
+        kwargs = {}
+        if n_iterations is not None:
+            kwargs['n_iterations'] = n_iterations
+        if relaxation is not None:
+            kwargs['relaxation'] = relaxation
+        reconstructed = self.katsmarc.reconstruct(meas_vector, **kwargs)
         reconstructed = reconstructed.reshape(self.image_shape)
 
         if reconstructed.max() > 0:
@@ -606,15 +714,24 @@ class MPIReconstructionComparator:
         cond_tensor = torch.tensor(cond[None, None],
                                     dtype=torch.float32, device=dev)
 
-        # 2) Условное сэмплирование (50 шагов из 100)
+        # 2) Условное сэмплирование. Используем ПОЛНЫЕ n_steps модели —
+        # x инициализируется как чистый шум (соответствует t = n_steps-1),
+        # поэтому обратный цикл должен идти от того же максимального t.
+        # Передача n_steps=50 при model.n_steps=100 ломала train/test
+        # consistency: модель училась с t ∈ [0, 100), а sample стартовал
+        # с t=49 при pure-noise входе → out-of-distribution → шум на выходе.
         self.diffusion_trainer.model.eval()
         with torch.no_grad():
             x = self.diffusion_trainer.model.sample(
                 cond_tensor,
-                n_steps=min(50, self.diffusion_trainer.model.n_steps),
+                n_steps=self.diffusion_trainer.model.n_steps,
             )
             reconstructed = x[0, 0].cpu().numpy()
 
+        # Концентрация ≥ 0 (физика). DDPM может выдать отрицательные
+        # значения в первых итерациях обучения — клиппим, иначе деление
+        # на max при отрицательном максимуме переворачивает изображение.
+        reconstructed = np.clip(reconstructed, 0.0, None)
         if reconstructed.max() > 0:
             reconstructed = reconstructed / reconstructed.max()
         return reconstructed
@@ -754,22 +871,28 @@ class MPIReconstructionComparator:
             ('KatsMarc', lambda m: self.katsmarc_reconstruction(m) if self.katsmarc else None, "Kaczmarz (1937)"),
             ('Chae(2017)', self.chae_reconstruction if hasattr(self, 'chae_model') and self.chae_model else None,
              "Chae - Single Layer NN"),
+            ('Chae-Multi(2017)',
+             self.chae_multi_reconstruction
+             if hasattr(self, 'chae_multi_model') and self.chae_multi_model else None,
+             "Chae - Multi Layer NN"),
             ('DIP(2020)',
              lambda m: self.dip_reconstruction(m) if hasattr(self, 'dip_model') and self.dip_model else None,
              "Dittmer et al."),
-            ('Shang(2022)', self.shang_reconstruction if hasattr(self, 'shang_model') and self.shang_model else None,
-             "Shang et al. - FDS-MPI"),
-            ('DEQ-MPI(2024)', self.deq_reconstruction if hasattr(self, 'deq_model') and self.deq_model else None,
-             "Güngör et al."),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
              "Huang et al. - Standard"),
-            ('PMCNet-Phys(2026)',
-             self.pmcnet_physics_enhanced_reconstruction if self.pmcnet_physics_enhanced else None,
-             "Huang et al. - +улучшенная физика"),
-            ('PMCNet-Final(2026)',
-             self.pmcnet_final_reconstruction if self.pmcnet_final else None,
-             "Huang et al. - +физика+NN-оптимизации"),
+            ('PMCNet-RadialCoil(2026)',
+             self.pmcnet_radial_coil_reconstruction if self.pmcnet_radial_coil else None,
+             "Paper + radial p(r) = 1/(1+(r/R)²)"),
+            ('PMCNet-Soft(2026)',
+             self.pmcnet_soft_reconstruction if self.pmcnet_soft else None,
+             "Phys + Scheinker 2023 soft constraints"),
+            ('PMCNet-Debye(2026)',
+             self.pmcnet_debye_reconstruction if self.pmcnet_debye else None,
+             "Phys + Debye-релаксация (обучаемая τ)"),
+            ('PMCNet-CentralFD(2026)',
+             self.pmcnet_central_fd_reconstruction if self.pmcnet_central_fd else None,
+             "Phys + центральная FD (O(Δt²))"),
             ('CNN', self.cnn_reconstruction if hasattr(self, 'cnn_trainer') and self.cnn_trainer else None, "CNN"),
             ('MoDL', self.modl_reconstruction if hasattr(self, 'modl_trainer') and self.modl_trainer else None, "MoDL"),
             ('MoE', self.moe_reconstruction if self.moe else None,
@@ -894,25 +1017,32 @@ class MPIReconstructionComparator:
         # Список всех методов с их источниками
         methods = [
             ('Тихонов', self.tikhonov_reconstruction, "Tikhonov (1963)"),
-            ('KatsMarc', lambda m: self.katsmarc_reconstruction(m, n_iterations=5) if self.katsmarc else None,
+            ('KatsMarc', lambda m: self.katsmarc_reconstruction(m) if self.katsmarc else None,
              "Kaczmarz (1937)"),
             ('Chae(2017)', self.chae_reconstruction if self.chae_model else None, "Chae - Single Layer NN"),
-            ('DIP(2020)', lambda m: self.dip_reconstruction(m, n_iterations=300) if self.dip_model else None,
+            ('Chae-Multi(2017)',
+             self.chae_multi_reconstruction if self.chae_multi_model else None,
+             "Chae - Multi Layer NN (с hidden слоем)"),
+            ('DIP(2020)', lambda m: self.dip_reconstruction(m) if self.dip_model else None,
              "Dittmer et al. - Deep Image Prior"),
-            ('Shang(2022)', self.shang_reconstruction if self.shang_model else None, "Shang et al. - FDS-MPI dual-branch"),
-            ('DEQ-MPI(2024)', self.deq_reconstruction if self.deq_model else None, "Güngör et al. - DEQ-MPI"),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
              "Huang et al. - SM-baseline (измеренная SM)"),
             ('PMCNet-Paper(2026)',
              self.pmcnet_paper_reconstruction if self.pmcnet_paper else None,
              "Huang et al. - paper-faithful (явная физика)"),
-            ('PMCNet-Phys(2026)',
-             self.pmcnet_physics_enhanced_reconstruction if self.pmcnet_physics_enhanced else None,
-             "Huang et al. - +радиальная p, центр. FD, langevin_safe"),
-            ('PMCNet-Final(2026)',
-             self.pmcnet_final_reconstruction if self.pmcnet_final else None,
-             "Huang et al. - +Debye+multi-color+TV"),
+            ('PMCNet-RadialCoil(2026)',
+             self.pmcnet_radial_coil_reconstruction if self.pmcnet_radial_coil else None,
+             "Paper + radial p(r) = 1/(1+(r/R)²)"),
+            ('PMCNet-Soft(2026)',
+             self.pmcnet_soft_reconstruction if self.pmcnet_soft else None,
+             "Phys + Scheinker 2023 soft (∇c² + freq-weighted L1)"),
+            ('PMCNet-Debye(2026)',
+             self.pmcnet_debye_reconstruction if self.pmcnet_debye else None,
+             "Phys + Debye-релаксация (обучаемая τ)"),
+            ('PMCNet-CentralFD(2026)',
+             self.pmcnet_central_fd_reconstruction if self.pmcnet_central_fd else None,
+             "Phys + центральная FD через Conv1d (O(Δt²))"),
             ('CNN', self.cnn_reconstruction if self.cnn_trainer else None, "CNN (UNet)"),
             ('MoDL', self.modl_reconstruction if self.modl_trainer else None, "MoDL Network"),
             ('Diffusion', self.diffusion_reconstruction if self.diffusion_trainer else None, "Diffusion Model"),
@@ -990,15 +1120,16 @@ class MPIReconstructionComparator:
         print("  2. KatsMarc             - Kaczmarz algorithm (1937) - ART")
         print("  3. Chae(2017)           - Single-layer FC NN (ETRI Journal)")
         print("  4. DIP(2020)            - Deep Image Prior (Dittmer et al.)")
-        print("  5. Shang(2022)          - FDS-MPI dual-branch CNN (PMB)")
-        print("  6. DEQ-MPI(2024)        - Deep Equilibrium Model (Güngör et al., IEEE TMI)")
-        print("  7. PMCNet-Std(2026)     - PMCNet Standard, измеренная SM (Huang et al.)")
-        print("  8. PMCNet-Phys(2026)    - PMCNet + улучшенная физика (аналитическая SM)")
-        print("  9. PMCNet-Final(2026)   - PMCNet + физика + NN-оптимизации")
-        print(" 10. CNN                  - U-Net baseline")
-        print(" 11. MoDL                 - Model-based Deep Learning")
-        print(" 12. Diffusion            - DDPM baseline")
-        print(" 13. MoE                  - Mixture of Experts (комбинирование моделей)")
+        print("  5. PMCNet-Std(2026)        - PMCNet Standard, измеренная SM (Huang et al.)")
+        print("  6. PMCNet-Paper(2026)      - PMCNet paper-faithful (явная физика)")
+        print("  7. PMCNet-RadialCoil(2026) - Paper + radial p(r)")
+        print("  8. PMCNet-Soft(2026)       - Paper + Scheinker 2023 soft constraints")
+        print("  9. PMCNet-Debye(2026)      - Paper + Debye-релаксация (обучаемая τ)")
+        print(" 10. PMCNet-CentralFD(2026)  - Paper + центральная FD (O(Δt²))")
+        print(" 11. CNN                     - U-Net baseline")
+        print(" 12. MoDL                    - Model-based Deep Learning")
+        print(" 13. Diffusion               - DDPM baseline")
+        print(" 14. MoE                     - Mixture of Experts (комбинирование моделей)")
         print("=" * 90)
 
         all_results = []
@@ -1113,15 +1244,16 @@ class MPIReconstructionComparator:
             f.write("2. KatsMarc             - Kaczmarz algorithm (1937) - ART\n")
             f.write("3. Chae(2017)           - Single-layer FC NN (ETRI Journal)\n")
             f.write("4. DIP(2020)            - Deep Image Prior (Dittmer et al.)\n")
-            f.write("5. Shang(2022)          - FDS-MPI dual-branch CNN (PMB)\n")
-            f.write("6. DEQ-MPI(2024)        - Deep Equilibrium Model (Güngör et al., IEEE TMI)\n")
-            f.write("7. PMCNet-Std(2026)     - PMCNet Standard, измеренная SM (Huang et al.)\n")
-            f.write("8. PMCNet-Phys(2026)    - PMCNet + улучшенная физика (аналитическая SM)\n")
-            f.write("9. PMCNet-Final(2026)   - PMCNet + физика + NN-оптимизации\n")
-            f.write("10. CNN                  - U-Net baseline\n")
-            f.write("11. MoDL                 - Model-based Deep Learning\n")
-            f.write("12. Diffusion            - DDPM baseline\n")
-            f.write("13. MoE                  - Mixture of Experts (комбинирование моделей)\n")
+            f.write("5. PMCNet-Std(2026)        - PMCNet Standard, измеренная SM (Huang et al.)\n")
+            f.write("6. PMCNet-Paper(2026)      - PMCNet paper-faithful (явная физика)\n")
+            f.write("7. PMCNet-RadialCoil(2026) - Paper + radial p(r)\n")
+            f.write("8. PMCNet-Soft(2026)       - Paper + Scheinker 2023 soft constraints\n")
+            f.write("9. PMCNet-Debye(2026)      - Paper + Debye-релаксация (обучаемая τ)\n")
+            f.write("10. PMCNet-CentralFD(2026) - Paper + центральная FD (O(Δt²))\n")
+            f.write("11. CNN                     - U-Net baseline\n")
+            f.write("12. MoDL                    - Model-based Deep Learning\n")
+            f.write("13. Diffusion               - DDPM baseline\n")
+            f.write("14. MoE                     - Mixture of Experts (комбинирование моделей)\n")
             f.write("\n" + "=" * 120 + "\n\n")
 
             for result in self.results:

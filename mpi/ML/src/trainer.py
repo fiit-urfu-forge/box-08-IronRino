@@ -1,4 +1,40 @@
-"""Тренировка нейросетевых моделей с tqdm"""
+"""Инфраструктура обучения нейросетевых моделей реконструкции MPI.
+
+## Что здесь есть
+
+  • **MPITrainer** — базовый тренер, инкапсулирующий стандартный цикл
+    train/validate/save для supervised-моделей (CNN, MoDL). Все
+    долгие циклы обёрнуты в tqdm для индикации прогресса.
+
+  • **ModelTrainerFactory** — фабрика, создающая правильно
+    сконфигурированный тренер под каждый тип модели (CNN, MoDL,
+    Diffusion). Скрывает детали гиперпараметров и аугментаций.
+
+## Когда использовать
+
+Только для supervised-моделей, обучающихся на парах (measurement,
+ground_truth):
+  • CNN baseline;
+  • MoDL Network;
+  • Diffusion model.
+
+Data-free методы (DIP, PMCNet) НЕ используют этот тренер — у них своя
+оптимизация в data-free режиме (метод `reconstruct()` каждой модели
+сам выполняет оптимизацию на одном измерении).
+
+PMCNet-варианты `PMCNetStandard/Paper/PhysicsEnhanced/Final` также
+не используют тренер — они вызываются через `.reconstruct(measurement)`
+из `MPIReconstructionComparator` напрямую.
+
+## Особенности реализации
+
+  • **Early stopping**: по validation loss или числу эпох.
+  • **Checkpoint saving**: лучший по val loss веса сохраняются на диск.
+  • **Gradient clipping**: max_norm=1.0 по умолчанию (защита от
+    взрыва градиентов в первых итерациях).
+  • **Tqdm на двух уровнях**: outer epoch progress + inner batch
+    progress (last leave=False, чтобы не засорять output).
+"""
 
 import torch
 import torch.nn as nn
@@ -38,8 +74,8 @@ class MPITrainer:
             self.model = MoDLNetwork(
                 system_matrix=kwargs.get('system_matrix'),
                 image_shape=kwargs.get('image_shape'),
-                n_iterations=kwargs.get('n_iterations', 3),
-                lambda_param=kwargs.get('lambda_param', 0.01),
+                n_iterations=kwargs.get('n_iterations', 5),
+                lambda_param=kwargs.get('lambda_param', 0.05),
                 base_filters=kwargs.get('base_filters', 32),
             )
         elif model_type == 'diffusion':

@@ -1,9 +1,36 @@
-"""Простые baseline-модели для MPI: U-Net CNN, MoDL, Diffusion.
+"""Baseline-модели для сравнения с целевыми методами реконструкции MPI.
 
-Не привязаны к конкретной статье — служат «контролем» для оценки того,
-сколько даёт перенос конкретной идеи (физическая модель PMCNet,
-dual-branch FDS-MPI, DEQ-итерации и т.д.) по сравнению с обычной
-прямой сетью.
+## Что здесь есть
+
+  • **MPIReconstructionCNN** — стандартный 2D U-Net. Принимает
+    измерение (расложенное в 4-канальный 2D-тензор), выдаёт изображение.
+    Полностью эмпирический подход: никакой физики, чистая регрессия
+    «сигнал → изображение» через свёрточную сеть. Служит baseline:
+    показывает, сколько даёт идея «просто использовать большую сеть»
+    без специальных трюков.
+
+  • **MoDLNetwork** (Model-based Deep Learning) — гибрид: чередует
+    шаги градиентного descent (по data-fit term ||A·c − u||²) с шагами
+    CNN-denoiser. Известный paradigm в medical imaging. Реализует
+    K итераций (default 5) одновременно с обучаемой residual-CNN внутри.
+
+  • **DiffusionModel** (DDPM-baseline) — модель из семейства
+    Denoising Diffusion Probabilistic Models. Учит сеть постепенно
+    «убирать шум» из изображения. Conditioning через Tikhonov-
+    реконструкцию измерения. Из коробки даёт высокое качество в
+    компьютерном зрении, но в MPI часто плохо переносится из-за
+    нестандартного распределения шума и низкого разрешения.
+
+## Зачем эти модели в проекте
+
+Все три — «contrast baseline»: они показывают, насколько целевые
+методы (PMCNet с физической моделью) выигрывают у простых
+эмпирических подходов на тех же данных.
+
+Если PMCNet даёт +0.2 SSIM по сравнению с MoDL — мы знаем, что
+физическая модель действительно помогает, а не просто «нейросеть с
+правильно настроенными параметрами». Это критически важно для
+defending claims о пользе конкретной архитектурной идеи.
 """
 
 import math
@@ -100,18 +127,21 @@ class MPIReconstructionCNN(nn.Module):
 
 
 class MoDLNetwork(nn.Module):
-    """Упрощённый MoDL (Aggarwal et al., 2019):
+    """MoDL (Aggarwal et al., 2019) — корректная реализация:
 
         x_{k+1} = (Aᵀ·A + λ·I)⁻¹ (Aᵀ·y + λ·D_θ(x_k))
 
-    где D_θ — обучаемый CNN-денойзер. K итераций разворачиваются в одном
-    forward, веса D_θ разделяются между итерациями. Используется как
-    base для сравнения «классическое разворачивание + обучаемый
-    регуляризатор».
+    где D_θ — DnCNN-style **residual** денойзер: D_θ(x) = x − N_θ(x),
+    N_θ предсказывает шум/артефакты. K итераций разворачиваются в
+    одном forward, веса N_θ разделяются между итерациями.
+
+    Важно: выход — линейный (после ReLU для физической неотрицательности),
+    но БЕЗ sigmoid. Финальный sigmoid ломал data-consistency: x — это
+    решение линейной системы, и нелинейность его искажала.
     """
 
     def __init__(self, system_matrix, image_shape,
-                 n_iterations: int = 3, lambda_param: float = 0.01,
+                 n_iterations: int = 5, lambda_param: float = 0.05,
                  base_filters: int = 32):
         super().__init__()
         if np.iscomplexobj(system_matrix):
@@ -131,8 +161,10 @@ class MoDLNetwork(nn.Module):
         self.register_buffer('LS_inverse', Inv)
         self.register_buffer('A_T', self.A.T.contiguous())
 
-        # Обучаемый денойзер: shared между итерациями
-        self.denoiser = nn.Sequential(
+        # Residual N_θ: учим шум/артефакты, далее D_θ(x) = x − N_θ(x).
+        # BatchNorm убран — при работе с одним каналом и небольшим
+        # батчем (8) BN даёт нестабильную статистику.
+        self.noise_predictor = nn.Sequential(
             nn.Conv2d(1, base_filters, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(base_filters, base_filters, kernel_size=3, padding=1),
@@ -150,11 +182,16 @@ class MoDLNetwork(nn.Module):
 
         for _ in range(self.n_iterations):
             x_img = x.view(B, 1, *self.image_shape)
-            d = self.denoiser(x_img).view(B, -1)
-            rhs = Aty + self.lambda_param * d
+            # DnCNN-style residual: денойзер предсказывает шум,
+            # денойз = x − предсказанный_шум.
+            denoised = x_img - self.noise_predictor(x_img)
+            rhs = Aty + self.lambda_param * denoised.view(B, -1)
             x = rhs @ self.LS_inverse.T
 
-        return torch.sigmoid(x.view(B, 1, *self.image_shape))
+        # ReLU вместо sigmoid: концентрация ≥ 0, но не ограничена сверху.
+        # Sigmoid + MSE даёт vanishing gradient у 0/1, разрушает линейную
+        # data-consistency, выученную (AᵀA+λI)⁻¹.
+        return F.relu(x.view(B, 1, *self.image_shape))
 
 
 # ---------------------------------------------------------------------------

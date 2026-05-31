@@ -134,13 +134,28 @@ class Visualization:
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
 
         colors = {'Тихонов': 'red', 'KatsMarc': 'brown', 'Chae(2017)': 'purple',
-                  'DIP(2020)': 'orange', 'Shang(2020)': 'pink', 'PGNet(2023)': 'cyan',
-                  'DEQ-MPI(2024)': 'magenta', 'CNN': 'blue', 'MoDL': 'green',
-                  'Diffusion': 'olive', 'Hybrid': 'darkblue'}
+                  'Chae-Multi(2017)': 'darkviolet',
+                  'DIP(2020)': 'orange', 'PGNet(2023)': 'cyan',
+                  'CNN': 'blue', 'MoDL': 'green',
+                  'Diffusion': 'olive', 'Hybrid': 'darkblue', 'MoE': 'black',
+                  # PMCNet-варианты для ablation:
+                  # — линия Std → Paper → Phys: тёплая прогрессия (база)
+                  # — три ветки от Phys: разные оттенки красного
+                  'PMCNet-Std(2026)': 'gold',
+                  'PMCNet-Paper(2026)': 'goldenrod',
+                  # Четыре параллельные ветки от Paper — разные оттенки красного
+                  'PMCNet-RadialCoil(2026)': 'darkorange',
+                  'PMCNet-Soft(2026)': 'orangered',
+                  'PMCNet-Debye(2026)': 'crimson',
+                  'PMCNet-CentralFD(2026)': 'firebrick'}
         markers = {'Тихонов': 'o', 'KatsMarc': 's', 'Chae(2017)': '^',
-                   'DIP(2020)': 'D', 'Shang(2020)': 'v', 'PGNet(2023)': '<',
-                   'DEQ-MPI(2024)': '>', 'CNN': 'p', 'MoDL': '*',
-                   'Diffusion': 'h', 'Hybrid': 'X'}
+                   'Chae-Multi(2017)': 'v',
+                   'DIP(2020)': 'D', 'PGNet(2023)': '<',
+                   'CNN': 'p', 'MoDL': '*',
+                   'Diffusion': 'h', 'Hybrid': 'X', 'MoE': '+',
+                   'PMCNet-Std(2026)': '1', 'PMCNet-Paper(2026)': '2',
+                   'PMCNet-RadialCoil(2026)': '3', 'PMCNet-Soft(2026)': '4',
+                   'PMCNet-Debye(2026)': 'P', 'PMCNet-CentralFD(2026)': 'X'}
 
         # SSIM
         for name in methods_data:

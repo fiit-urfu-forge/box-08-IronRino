@@ -1,18 +1,47 @@
-"""Симуляторы синтетических MPI-измерений: два независимых пути.
+"""Симуляторы синтетических измерений MPI — два независимых пути.
 
-Согласно постановке Chae (2017), сигнал MPI можно получить либо через
-прямые физические уравнения (функция Ланжевена + производная по
-времени драйв-поля), либо через готовую системную матрицу, в которой
-столбцы соответствуют полиномам Чебышёва второго рода.
+## Зачем два пути
 
-В этом модуле:
-  • `ChebyshevSystemFunction` — Chebyshev-системная матрица (Chae 2017,
-    Rahmer 2009);
-  • `PhysicalMPISimulator`   — прямые физические уравнения (адиабатическая
-    модель Ланжевена);
-  • `SyntheticDatasetGenerator` — высокоуровневый генератор обучающих
-    выборок: создаёт пары `(image, measurement)` через любой из двух
-    методов, с шумом или без, для всех типов фантомов.
+Для обучения и валидации нейросетевых методов реконструкции нужна
+обучающая выборка — пары (image, measurement). Реальные измерения
+получают часами на сканере, поэтому используют симуляцию.
+
+Сигнал MPI можно симулировать двумя независимыми способами:
+
+  1. **Через готовую системную матрицу** (`ChebyshevSystemFunction`):
+     S — матрица, где столбец n содержит спектр отклика на дельта-фантом
+     в вокселе n. Измерение u = S · c — одно матричное умножение.
+     Для аналитической модели MPI столбцы S теоретически совпадают с
+     полиномами Чебышёва второго рода.
+
+  2. **Через прямые физические уравнения** (`PhysicalMPISimulator`):
+     Численное интегрирование u(t) = -μ₀ · ∫ s(r) · ∂M/∂t · c(r) dr,
+     где M(r,t) — намагниченность по Ланжевену от полного поля. Без
+     каких-либо предвычислений матриц — каждое измерение пересчитывается
+     с нуля.
+
+## Зачем оба
+
+  • SM-путь быстрее (одно умножение), используется для генерации
+    большой обучающей выборки.
+  • Физический путь точнее, медленнее, не зависит от того, какая SM
+    использовалась для калибровки. Удобен для валидации.
+
+В пайплайне обе версии создаются параллельно: модель учится на SM-пути,
+а тестируется на обоих — это показывает, насколько метод обобщается
+с одной модели физики на другую.
+
+## Структура модуля
+
+  • `NanoparticleProperties`  — dataclass с физическими параметрами SPION
+    (диаметр, B_sat, температура).
+  • `ChebyshevSystemFunction` — построение Чебышёв-SM для аналитического
+    1D/2D MPI с заданными параметрами.
+  • `PhysicalMPISimulator`    — численная симуляция через адиабатический
+    Langevin + конечно-разностная производная.
+  • `SyntheticDatasetGenerator` — высокоуровневый генератор: принимает
+    список типов фантомов и размеров частиц, выдаёт обучающую и тестовую
+    выборки в едином формате.
 """
 
 import os
@@ -251,25 +280,32 @@ class SyntheticDatasetGenerator:
                 radius = np.random.uniform(0.1, 0.3)
                 distance = np.random.uniform(radius, min(2 * radius, 0.8))
                 return self.phantom_gen.two_droplets(radius, distance)
-            if phantom_type == PhantomType.CONCENTRATION:
-                return self.phantom_gen.concentration_phantom()
-            if phantom_type == PhantomType.RESOLUTION:
-                return self.phantom_gen.resolution_phantom()
             if phantom_type == PhantomType.ROTATION:
                 return self.phantom_gen.rotation_phantom(
                     np.random.uniform(0, 360))
-            if phantom_type == PhantomType.SHAPE:
-                return self.phantom_gen.shape_phantom(np.random.choice(
-                    ['cone', 'square', 'ring', 'cross', 'spiral']))
             if phantom_type == PhantomType.RANDOM:
                 return self.phantom_gen.random_phantom(np.random.randint(3, 8))
-            if phantom_type == PhantomType.PATTERN:
-                return self.phantom_gen.pattern_phantom(
-                    np.random.choice(['checkerboard', 'stripes_h',
-                                      'stripes_v', 'radial']),
-                    np.random.randint(3, 6))
             if phantom_type == PhantomType.PHANTOM_4:
                 return self.phantom_gen.phantom_4()
+            if phantom_type == PhantomType.MULTI_POINT:
+                # 2–10 точек с min-distance и разной концентрацией.
+                # Покрывает phantom_4 / random / two_droplets как частные
+                # случаи и расширяет диапазон.
+                return self.phantom_gen.multi_point_phantom(
+                    n_min=2, n_max=10,
+                    min_distance=np.random.uniform(0.18, 0.35),
+                )
+            if phantom_type == PhantomType.LINES:
+                # 1–3 непрерывных линии (сосудистые фантомы)
+                return self.phantom_gen.lines_phantom(
+                    n_lines_min=1, n_lines_max=3,
+                )
+            if phantom_type == PhantomType.CIRCLES:
+                # 1–3 кольца/диска со случайными радиусами — покрывает
+                # shape_ring как частный случай
+                return self.phantom_gen.circles_phantom(
+                    n_circles_min=1, n_circles_max=3,
+                )
             return self.phantom_gen.random_phantom(4)
         except Exception as e:
             print(f"    Warning: phantom {phantom_type} fallback: {e}")
@@ -346,6 +382,7 @@ class SyntheticDatasetGenerator:
     @staticmethod
     def save_dataset(dataset: Dict,
                      filename_prefix: str = './DATA/dataset/synthetic'):
+        """Сохранить датасет в 5 файлов: 4 npy-массива + json с метаданными."""
         os.makedirs(os.path.dirname(filename_prefix), exist_ok=True)
         np.save(f'{filename_prefix}_X_train.npy', dataset['X_train'])
         np.save(f'{filename_prefix}_X_test.npy', dataset['X_test'])
@@ -360,13 +397,49 @@ class SyntheticDatasetGenerator:
                 'method': dataset['method'],
             }, f, indent=2)
 
+    @staticmethod
+    def dataset_exists(filename_prefix: str) -> bool:
+        """Проверить, что все 5 файлов датасета существуют."""
+        return all(os.path.exists(f'{filename_prefix}_{suffix}')
+                   for suffix in ('X_train.npy', 'X_test.npy',
+                                  'y_train.npy', 'y_test.npy',
+                                  'metadata.json'))
+
+    @staticmethod
+    def load_dataset(filename_prefix: str = './DATA/dataset/synthetic') -> Dict:
+        """Загрузить датасет, сохранённый через `save_dataset`.
+
+        Returns:
+            dict с теми же ключами, что и `generate_dataset`:
+            X_train, X_test, y_train, y_test (numpy arrays),
+            metadata_train, metadata_test (lists of dicts),
+            image_shape (tuple), n_harmonics (int), method (str).
+
+        Raises:
+            FileNotFoundError: если хотя бы один из файлов отсутствует.
+                               Перед вызовом используйте `dataset_exists`.
+        """
+        with open(f'{filename_prefix}_metadata.json', 'r') as f:
+            meta = json.load(f)
+        return {
+            'X_train': np.load(f'{filename_prefix}_X_train.npy'),
+            'X_test': np.load(f'{filename_prefix}_X_test.npy'),
+            'y_train': np.load(f'{filename_prefix}_y_train.npy'),
+            'y_test': np.load(f'{filename_prefix}_y_test.npy'),
+            'metadata_train': meta['metadata_train'],
+            'metadata_test': meta['metadata_test'],
+            'image_shape': tuple(meta['image_shape']),
+            'n_harmonics': meta['n_harmonics'],
+            'method': meta['method'],
+        }
+
     def create_training_pipeline_dataset(self, n_samples: int = 5000,
                                          include_all_phantoms: bool = True,
                                          save: bool = True) -> Dict:
         phantom_types = (list(PhantomType) if include_all_phantoms else
-                         [PhantomType.TWO_DROPLETS, PhantomType.CONCENTRATION,
-                          PhantomType.RESOLUTION, PhantomType.ROTATION,
-                          PhantomType.SHAPE])
+                         [PhantomType.TWO_DROPLETS, PhantomType.PHANTOM_4,
+                          PhantomType.ROTATION, PhantomType.MULTI_POINT,
+                          PhantomType.CIRCLES])
         dataset = self.generate_dataset(
             n_samples=n_samples, method='system_matrix',
             phantom_types=phantom_types,

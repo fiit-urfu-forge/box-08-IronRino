@@ -5,17 +5,13 @@
   classical.py  — TikhonovReconstructor, KatsMarcAlgorithm
   chae.py       — ChaeSingleLayerNN, ChaeMultiLayerNN          (Chae 2017)
   dip.py        — DeepImagePrior                                 (Dittmer 2020)
-  shang.py      — ShangCNN (= FDSMPI)                            (Shang 2022)
-  deq.py        — DEQMPI, RDNBlock, LCBlock                      (Güngör 2024)
-  pmcnet.py     — PMCNet + два уточнения                          (Huang 2026)
+  pmcnet.py     — PMCNet + три варианта улучшений                 (Huang 2026)
   simple.py     — MPIReconstructionCNN, MoDLNetwork, DiffusionModel (baselines)
 """
 
 from .classical import TikhonovReconstructor, KatsMarcAlgorithm
 from .chae import ChaeSingleLayerNN, ChaeMultiLayerNN
 from .dip import DeepImagePrior
-from .shang import ShangCNN, FDSMPI
-from .deq import DEQMPI, RDNBlock, LCBlock
 from .simple import MPIReconstructionCNN, MoDLNetwork, DiffusionModel
 from .moe import MoEReconstructor
 from .pmcnet import (
@@ -26,8 +22,10 @@ from .pmcnet import (
     PMCNetPaperReconstructor,
     PMCNetStandard,
     PMCNetPaper,
-    PMCNetPhysicsEnhanced,
-    PMCNetFinal,
+    PMCNetRadialCoil,
+    PMCNetSoftConstrained,
+    PMCNetDebye,
+    PMCNetCentralFD,
     DebyeRelaxationFilter,
     SystemMatrixForward,
     # Paper-faithful primitives
@@ -53,8 +51,6 @@ __all__ = [
     # Per-paper
     'ChaeSingleLayerNN', 'ChaeMultiLayerNN',
     'DeepImagePrior',
-    'ShangCNN', 'FDSMPI',
-    'DEQMPI', 'RDNBlock', 'LCBlock',
     # Baselines
     'MPIReconstructionCNN', 'MoDLNetwork', 'DiffusionModel',
     # Mixture of Experts
@@ -64,7 +60,8 @@ __all__ = [
     'PMCNet', 'PMCNetWithBasicPhysics',
     'PMCNetReconstructor', 'PMCNetPaperReconstructor',
     'PMCNetStandard', 'PMCNetPaper',
-    'PMCNetPhysicsEnhanced', 'PMCNetFinal',
+    'PMCNetRadialCoil', 'PMCNetSoftConstrained',
+    'PMCNetDebye', 'PMCNetCentralFD',
     'DebyeRelaxationFilter', 'SystemMatrixForward',
     # Paper-faithful primitives
     'UniformCoilSensitivity', 'TimeDerivativeForwardFD',

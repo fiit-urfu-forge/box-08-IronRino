@@ -3,19 +3,26 @@
 Никакой физики MNP — только пиксельные распределения концентрации,
 которые подаются на вход симуляторов в `data/simulators.py`.
 
-Поддерживаемые типы (см. `PhantomType`):
-  • TWO_DROPLETS — две гауссовы капли (исторически базовый тест MPI);
-  • CONCENTRATION — центральная капля + кольцо + 4 угловых точки;
-  • RESOLUTION   — пять точек переменного размера для оценки разрешения;
-  • ROTATION     — крест с угловыми маркерами под заданным углом;
-  • SHAPE        — конус / квадрат / кольцо / крест / спираль;
-  • RANDOM       — случайные капли (для аугментации обучающей выборки);
-  • PATTERN      — периодические узоры (шахматка, полосы, радиальный);
-  • PHANTOM_4    — 4 угловые капли (классический «четыре точки»).
+Все типы фантомов покрывают тестовую батарею в `build_phantom_battery`:
+  • TWO_DROPLETS — две гауссовы капли (test: two_droplets);
+  • PHANTOM_4    — 4 угловые капли (test: phantom_4);
+  • ROTATION     — крест с маркерами под углом (test: rotation_45);
+  • RANDOM       — случайные капли (test: random);
+  • MULTI_POINT  — произвольное число точек (2–10) с min-distance —
+                   расширяет two_droplets и phantom_4;
+  • LINES        — 1–3 непрерывных линейных сегмента (сосудистые фантомы);
+  • CIRCLES      — 1–3 непрерывных кольца/диска (расширяет shape_ring).
+
+Также есть служебные методы:
+  • `shape_phantom('ring')`  — детерминированное кольцо для тестов;
+  • `letter_phantom('B')`    — приближение буквы B для real-data validation
+                               (как approximate ground truth для
+                               MeasurementData_B.h5).
 """
 
 import os
 from enum import Enum
+from typing import Optional
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -23,15 +30,14 @@ from scipy.ndimage import gaussian_filter, rotate
 
 
 class PhantomType(Enum):
-    """Типы синтетических 2D-фантомов."""
+    """Типы синтетических 2D-фантомов (совпадают с типами в тест-батарее)."""
     TWO_DROPLETS = "two_droplets"
-    CONCENTRATION = "concentration"
-    RESOLUTION = "resolution"
     ROTATION = "rotation"
-    SHAPE = "shape"
     RANDOM = "random"
-    PATTERN = "pattern"
     PHANTOM_4 = "phantom_4"
+    MULTI_POINT = "multi_point"
+    LINES = "lines"
+    CIRCLES = "circles"
 
 
 class PhantomGenerator:
@@ -65,33 +71,6 @@ class PhantomGenerator:
 
     # ---- составные фантомы ---------------------------------------------------
 
-    def concentration_phantom(self) -> np.ndarray:
-        """Центральная капля + кольцо + 4 угловых точки разной интенсивности."""
-        center = np.exp(-(self.X ** 2 + self.Y ** 2) / (2 * 0.15 ** 2)) * 1.0
-        R = np.sqrt(self.X ** 2 + self.Y ** 2)
-        ring = np.exp(-((R - 0.5) ** 2) / (2 * 0.1 ** 2)) * 0.6
-
-        corners = np.zeros((self.nx, self.ny))
-        for cx, cy in [(-0.7, -0.7), (0.7, -0.7), (0.7, 0.7), (-0.7, 0.7)]:
-            corner = np.exp(-((self.X - cx) ** 2 + (self.Y - cy) ** 2)
-                            / (2 * 0.12 ** 2)) * 0.3
-            corners = np.maximum(corners, corner)
-
-        return self.normalize(np.maximum.reduce([center, ring, corners]))
-
-    def resolution_phantom(self) -> np.ndarray:
-        """5 точек разного размера по оси x + 2 точки по оси y."""
-        image = np.zeros((self.nx, self.ny))
-        for cx, r, intensity in zip(
-            [-0.6, -0.3, 0.0, 0.3, 0.6],
-            [0.12, 0.09, 0.06, 0.09, 0.12],
-            [0.8, 0.9, 1.0, 0.9, 0.8],
-        ):
-            image = np.maximum(image, self.gaussian_droplet(cx, 0, r, intensity))
-        for cy in [-0.4, 0.4]:
-            image = np.maximum(image, self.gaussian_droplet(0, cy, 0.08, 0.7))
-        return self.normalize(image)
-
     def rotation_phantom(self, angle_deg: float = 0.0) -> np.ndarray:
         """Крест в центре + угловые маркеры, повернутые на `angle_deg`."""
         base = np.zeros((self.nx, self.ny))
@@ -107,29 +86,22 @@ class PhantomGenerator:
         rotated = rotate(base, angle_deg, reshape=False, order=1)
         return self.normalize(gaussian_filter(rotated, sigma=0.8))
 
-    def shape_phantom(self, shape_type: str = 'cone') -> np.ndarray:
-        """Различные геометрические формы."""
-        if shape_type == 'cone':
-            R = np.sqrt(self.X ** 2 + self.Y ** 2)
-            image = np.maximum(0, 1 - R) ** 2
-        elif shape_type == 'square':
-            image = np.where((np.abs(self.X) < 0.5) & (np.abs(self.Y) < 0.5), 1.0, 0.0)
-        elif shape_type == 'ring':
-            R = np.sqrt(self.X ** 2 + self.Y ** 2)
-            image = np.exp(-((R - 0.5) ** 2) / (2 * 0.08 ** 2))
-        elif shape_type == 'cross':
-            image = np.zeros((self.nx, self.ny))
-            cy, cx = self.ny // 2, self.nx // 2
-            image[cx - 8:cx + 9, cy - 2:cy + 3] = 1.0
-            image[cx - 2:cx + 3, cy - 8:cy + 9] = 1.0
-            image = gaussian_filter(image, sigma=0.5)
-        elif shape_type == 'spiral':
-            theta = np.arctan2(self.Y, self.X)
-            R = np.sqrt(self.X ** 2 + self.Y ** 2)
-            image = 0.5 + 0.5 * np.cos(4 * theta + 4 * np.pi * R)
-            image = np.where(R < 0.9, image, 0)
-        else:
-            image = np.zeros((self.nx, self.ny))
+    def shape_phantom(self, shape_type: str = 'ring') -> np.ndarray:
+        """Детерминированное центрированное кольцо (R=0.5, толщина 0.08).
+
+        Используется тест-батареей как `shape_ring` фантом. Параметр
+        `shape_type` оставлен для совместимости интерфейса; поддерживается
+        только 'ring'. Для произвольных колец с варьируемыми параметрами
+        см. `circles_phantom`.
+        """
+        if shape_type != 'ring':
+            raise ValueError(
+                f"shape_phantom поддерживает только 'ring' (получено: "
+                f"{shape_type!r}). Для других форм см. circles_phantom, "
+                f"multi_point_phantom, lines_phantom."
+            )
+        R = np.sqrt(self.X ** 2 + self.Y ** 2)
+        image = np.exp(-((R - 0.5) ** 2) / (2 * 0.08 ** 2))
         return self.normalize(image)
 
     def phantom_4(self) -> np.ndarray:
@@ -151,13 +123,152 @@ class PhantomGenerator:
             )
         return self.normalize(image)
 
-    def letter_phantom(self, letter: str = 'B') -> np.ndarray:
-        """Простой буквенный фантом (B / A / U) — приближение к реальным
-        фантомам из BeihangUniversityData (MeasurementData_{A,B,U}.h5).
+    # ---- новые типы для расширения обучающей выборки ------------------------
 
-        Контуры рисуются по нормированной сетке [−1, 1] в стилизованной
-        форме, чтобы при разных `nx, ny` пропорции сохранялись.
+    def multi_point_phantom(self, n_min: int = 2, n_max: int = 10,
+                            min_distance: float = 0.25,
+                            radius_range: tuple = (0.06, 0.18),
+                            concentration_range: tuple = (0.3, 1.0),
+                            max_attempts_per_point: int = 50) -> np.ndarray:
+        """Произвольное число точек (N ∈ [n_min, n_max]) с минимальным
+        расстоянием между ними и разной концентрацией.
+
+        Расширенная версия RANDOM: точки гарантированно не сливаются благодаря
+        rejection-sampling с `min_distance`. Покрывает phantom_4-подобные
+        конфигурации (2, 3, 4, 5, ... точек), где модель должна научиться
+        локализовать дискретные источники с переменным количеством.
+
+        Args:
+            n_min, n_max: диапазон случайного выбора числа точек.
+            min_distance: минимальное расстояние между центрами в [−1, 1]
+                          координатах (0.25 = 25% радиуса FOV).
+            radius_range: (min, max) размер каждой капли (sigma в gaussian).
+            concentration_range: (min, max) амплитуда каждой капли.
+            max_attempts_per_point: сколько попыток до отказа от текущей
+                                     точки (предотвращает бесконечный цикл).
         """
+        n = np.random.randint(n_min, n_max + 1)
+        image = np.zeros((self.nx, self.ny))
+        centers = []
+        for _ in range(n):
+            for _attempt in range(max_attempts_per_point):
+                cx = np.random.uniform(-0.85, 0.85)
+                cy = np.random.uniform(-0.85, 0.85)
+                ok = all(
+                    (cx - px) ** 2 + (cy - py) ** 2 >= min_distance ** 2
+                    for px, py in centers
+                )
+                if ok:
+                    centers.append((cx, cy))
+                    image += self.gaussian_droplet(
+                        cx, cy,
+                        np.random.uniform(*radius_range),
+                        np.random.uniform(*concentration_range),
+                    )
+                    break
+            # Если не нашли место за max_attempts — пропускаем эту точку
+        return self.normalize(image)
+
+    def lines_phantom(self, n_lines_min: int = 1, n_lines_max: int = 3,
+                      thickness_range: tuple = (0.025, 0.06),
+                      intensity_range: tuple = (0.5, 1.0)) -> np.ndarray:
+        """1–3 непрерывных линейных сегмента — приближение сосудистых фантомов.
+
+        Каждая линия задаётся двумя случайными концами в FOV. Толщина —
+        гауссово размытие вдоль перпендикуляра. Несколько линий могут
+        пересекаться (имитация бифуркаций сосудов).
+
+        Используется как:
+          (а) Тест разрешения в нелинейных режимах (длинные линии нагружают
+              продольный отклик частиц);
+          (б) Структурно-непрерывный фантом для регуляризационных моделей
+              (TV-регуляризация в Final ожидает кусочно-гладкие изображения).
+        """
+        n_lines = np.random.randint(n_lines_min, n_lines_max + 1)
+        image = np.zeros((self.nx, self.ny))
+        for _ in range(n_lines):
+            # Случайные концы отрезка
+            x0, y0 = np.random.uniform(-0.8, 0.8, 2)
+            x1, y1 = np.random.uniform(-0.8, 0.8, 2)
+            thickness = np.random.uniform(*thickness_range)
+            intensity = np.random.uniform(*intensity_range)
+            # Расстояние от каждого пикселя до отрезка [(x0,y0)→(x1,y1)]
+            dx, dy = x1 - x0, y1 - y0
+            seg_len_sq = dx * dx + dy * dy
+            if seg_len_sq < 1e-8:
+                continue  # вырожденный отрезок (точка)
+            # Проекция (X-x0, Y-y0) на (dx, dy), параметризованная t ∈ [0, 1]
+            t = ((self.X - x0) * dx + (self.Y - y0) * dy) / seg_len_sq
+            t = np.clip(t, 0.0, 1.0)
+            # Ближайшая точка на отрезке
+            proj_x = x0 + t * dx
+            proj_y = y0 + t * dy
+            # Расстояние до отрезка
+            dist_sq = (self.X - proj_x) ** 2 + (self.Y - proj_y) ** 2
+            # Гауссов профиль вдоль перпендикуляра
+            image += intensity * np.exp(-dist_sq / (2.0 * thickness ** 2))
+        return self.normalize(image)
+
+    def circles_phantom(self, n_circles_min: int = 1, n_circles_max: int = 3,
+                        radius_range: tuple = (0.18, 0.5),
+                        thickness_range: tuple = (0.03, 0.08),
+                        intensity_range: tuple = (0.5, 1.0),
+                        allow_filled: bool = True) -> np.ndarray:
+        """1–3 непрерывных кольца/диска со случайными параметрами.
+
+        Покрывает shape_ring-подобные конфигурации, но с варьируемой
+        геометрией. Если `allow_filled=True`, ~30% колец заполняются
+        (диски), остальные остаются полыми (кольца). Несколько колец могут
+        быть концентрическими.
+
+        Args:
+            n_circles_min, n_circles_max: диапазон числа колец.
+            radius_range: (min, max) радиус каждого кольца.
+            thickness_range: (min, max) толщина границы (sigma).
+            intensity_range: (min, max) амплитуда.
+            allow_filled: разрешить заполненные диски (иначе только кольца).
+        """
+        n = np.random.randint(n_circles_min, n_circles_max + 1)
+        image = np.zeros((self.nx, self.ny))
+        for _ in range(n):
+            # Центр и радиус кольца. Центр сдвигается так, чтобы кольцо
+            # помещалось в FOV (с запасом)
+            R = np.random.uniform(*radius_range)
+            max_off = max(0.0, 0.9 - R)
+            cx = np.random.uniform(-max_off, max_off)
+            cy = np.random.uniform(-max_off, max_off)
+            thickness = np.random.uniform(*thickness_range)
+            intensity = np.random.uniform(*intensity_range)
+            r_pixel = np.sqrt((self.X - cx) ** 2 + (self.Y - cy) ** 2)
+            if allow_filled and np.random.random() < 0.3:
+                # Заполненный диск: 1 внутри R, плавный край
+                disk_dist = np.maximum(r_pixel - R, 0.0)
+                image += intensity * np.exp(-disk_dist ** 2 / (2.0 * thickness ** 2))
+            else:
+                # Кольцо: гауссова "толщина" вокруг r=R
+                image += intensity * np.exp(
+                    -(r_pixel - R) ** 2 / (2.0 * thickness ** 2)
+                )
+        return self.normalize(image)
+
+    def letter_phantom(self, letter: str = 'B') -> np.ndarray:
+        """Стилизованная буква 'B' — приближение к реальному фантому из
+        BeihangUniversityData (MeasurementData_B.h5).
+
+        Используется тест-батареей как approximate ground truth при
+        валидации на real-data (точная форма фантома B известна по
+        дизайну; точное изображение со сканера недоступно). Параметр
+        `letter` оставлен для совместимости интерфейса; поддерживается
+        только 'B'.
+
+        Контуры рисуются по нормированной сетке [−1, 1] — пропорции
+        сохраняются при разных `nx, ny`.
+        """
+        if letter.upper() != 'B':
+            raise ValueError(
+                f"letter_phantom поддерживает только 'B' (получено: "
+                f"{letter!r})."
+            )
         img = np.zeros((self.nx, self.ny), dtype=np.float32)
 
         def rect(x0, x1, y0, y1, v=1.0):
@@ -170,53 +281,13 @@ class PhantomGenerator:
             mask = d2 <= r * r
             img[mask] = np.maximum(img[mask], v)
 
-        L = letter.upper()
-        if L == 'B':
-            # Вертикальная палка (left bar) + две полуокружности справа
-            rect(-0.6, -0.4, -0.8, 0.8)
-            disk(-0.1, 0.4, 0.4)
-            disk(-0.1, -0.4, 0.4)
-            disk(0.0, 0.4, 0.22, 0.0)        # вырезаем «дырку» = 0
-            disk(0.0, -0.4, 0.22, 0.0)
-        elif L == 'A':
-            # Две диагонали + горизонтальная перемычка
-            for t in np.linspace(0, 1, 100):
-                # left leg: (−0.6, −0.8) → (0, 0.8)
-                x1 = -0.6 + 0.6 * t; y1 = -0.8 + 1.6 * t
-                # right leg: (0.6, −0.8) → (0, 0.8)
-                x2 = 0.6 - 0.6 * t; y2 = -0.8 + 1.6 * t
-                disk(x1, y1, 0.08)
-                disk(x2, y2, 0.08)
-            rect(-0.3, 0.3, -0.05, 0.05)      # перемычка
-        elif L == 'U':
-            # Две вертикальные палки + нижняя полуокружность
-            rect(-0.6, -0.4, -0.4, 0.8)
-            rect(0.4, 0.6, -0.4, 0.8)
-            for ang in np.linspace(np.pi, 2 * np.pi, 60):
-                cx, cy = 0.5 * np.cos(ang), -0.4 + 0.5 * np.sin(ang)
-                disk(cx, cy, 0.12)
-        else:
-            # Fallback: квадрат
-            rect(-0.4, 0.4, -0.4, 0.4)
-
+        # Вертикальная палка (left bar) + две полуокружности справа
+        rect(-0.6, -0.4, -0.8, 0.8)
+        disk(-0.1, 0.4, 0.4)
+        disk(-0.1, -0.4, 0.4)
+        disk(0.0, 0.4, 0.22, 0.0)        # вырезаем «дырку» = 0
+        disk(0.0, -0.4, 0.22, 0.0)
         return self.normalize(img)
-
-    def pattern_phantom(self, pattern: str = 'checkerboard',
-                        frequency: int = 4) -> np.ndarray:
-        """Периодические узоры — для тестирования передаточной функции."""
-        if pattern == 'checkerboard':
-            image = 0.5 + 0.5 * np.sin(frequency * np.pi * self.X) * np.sin(frequency * np.pi * self.Y)
-        elif pattern == 'stripes_h':
-            image = 0.5 + 0.5 * np.sin(frequency * np.pi * self.Y)
-        elif pattern == 'stripes_v':
-            image = 0.5 + 0.5 * np.sin(frequency * np.pi * self.X)
-        elif pattern == 'radial':
-            R = np.sqrt(self.X ** 2 + self.Y ** 2)
-            theta = np.arctan2(self.Y, self.X)
-            image = 0.5 + 0.5 * np.cos(frequency * theta + 4 * np.pi * R)
-        else:
-            image = np.zeros((self.nx, self.ny))
-        return self.normalize(np.maximum(0, image))
 
     # ---- утилиты -------------------------------------------------------------
 
@@ -231,16 +302,14 @@ class PhantomGenerator:
         """Сетка изображений всех типов фантомов — для отчётов."""
         phantoms = {
             'Two Droplets': self.two_droplets(radius=0.2, distance=0.2),
-            'Concentration': self.concentration_phantom(),
-            'Resolution': self.resolution_phantom(),
-            'Rotation (0°)': self.rotation_phantom(0),
             'Rotation (45°)': self.rotation_phantom(45),
-            'Shape (Cone)': self.shape_phantom('cone'),
-            'Shape (Ring)': self.shape_phantom('ring'),
-            'Shape (Spiral)': self.shape_phantom('spiral'),
             'Phantom 4': self.phantom_4(),
             'Random': self.random_phantom(5),
-            'Pattern (Checkerboard)': self.pattern_phantom('checkerboard', 4),
+            'Multi-Point': self.multi_point_phantom(n_min=4, n_max=8),
+            'Lines': self.lines_phantom(n_lines_min=2, n_lines_max=3),
+            'Circles': self.circles_phantom(n_circles_min=2, n_circles_max=3),
+            'Shape (Ring)': self.shape_phantom('ring'),
+            'Letter B': self.letter_phantom('B'),
         }
         cols = 4
         rows = (len(phantoms) + cols - 1) // cols
