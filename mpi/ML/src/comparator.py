@@ -344,8 +344,13 @@ class MPIReconstructionComparator:
     # ====================================================================
     # МЕТОД 2: Dittmer et al. (2020) - Deep Image Prior (DIP)
     # ====================================================================
-    def dip_reconstruction(self, measurement, n_iterations=3000,
-                            patience: int = 250):
+    def dip_reconstruction(self, measurement, n_iterations=6000,
+                            patience: int = 500):
+        # n_iterations 3000 → 6000, patience 250 → 500: на предыдущем
+        # прогоне DIP давал SSIM 0.05-0.90 (огромный разброс), а early
+        # stop часто срабатывал поздно (>2000 итер). Удвоение даёт
+        # запас сходимости на сложных фантомах без риска переобучения
+        # к шуму — patience всё равно остановит, когда loss-plateau.
         """Реконструкция Deep Image Prior c early stopping и фикс. z.
 
         Изменения относительно прежней версии (соответствие Dittmer 2020):
@@ -358,7 +363,7 @@ class MPIReconstructionComparator:
             благодаря выбору момента остановки.
           • **lr=1e-3** (было 0.01) — Adam с lr=0.01 на DIP-генераторе
             типично взрывается за 200 итераций.
-          • **n_iterations=3000** дефолт (было 500) — даёт early
+          • **n_iterations=6000** дефолт (поднято с 3000) — даёт early
             stopping шанс отработать на сложных фантомах.
         """
         if self.dip_model is None:

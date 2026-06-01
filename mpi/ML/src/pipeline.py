@@ -342,7 +342,10 @@ def _format_for_modl(X_complex):
 # --- CNN baseline -----------------------------------------------------------
 
 def train_or_load_cnn(X_train, y_train, train: bool = True,
-                      epochs: int = 40, output_size=(51, 51)):
+                      epochs: int = 80, output_size=(51, 51)):
+    # epochs повышен 40 → 80: на полнокартинной reconstruction CNN
+    # доходит до плато только после ~60 эпох. На предыдущем прогоне
+    # CNN давал SSIM 0.15-0.49 — типичные признаки недотренировки.
     print("\n  CNN baseline (UNet)...")
     path = './DATA/models/cnn_best.pth'
     trainer = ModelTrainerFactory.create_cnn_trainer(
@@ -368,7 +371,12 @@ def train_or_load_cnn(X_train, y_train, train: bool = True,
 # --- MoDL baseline ----------------------------------------------------------
 
 def train_or_load_modl(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 30):
+                       train: bool = True, epochs: int = 60):
+    # epochs повышен 30 → 60: MoDL с 5 unrolled-итерациями и residual
+    # denoiser требует больше эпох для сходимости — каждая эпоха
+    # тренирует ВСЕ итерации вместе. На предыдущем прогоне на простых
+    # фантомах SSIM уже хорош (0.8-0.96), но на сложных (rotation,
+    # ring physical) проседает до 0.04-0.15.
     print("\n  MoDL baseline...")
     path = './DATA/models/modl_best.pth'
     trainer = ModelTrainerFactory.create_modl_trainer(
@@ -396,7 +404,12 @@ def train_or_load_modl(SM, image_shape, X_train, y_train,
 # --- Diffusion baseline -----------------------------------------------------
 
 def train_or_load_diffusion(y_train, X_train, SM,
-                            train: bool = True, epochs: int = 25):
+                            train: bool = True, epochs: int = 80):
+    # epochs повышен 25 → 80: DDPM с 100 timesteps и единственный пример
+    # на батч учит t-эмбединги ОЧЕНЬ медленно — 25 эпох × 500 примеров
+    # = только ~125 шагов на каждый из 100 timesteps. На предыдущем
+    # прогоне Diffusion давал SSIM 0.01-0.41 (sm режим), на physical
+    # вообще ~0.0. 80 эпох × 500 = 400 шагов/timestep — приемлемо.
     """Conditional DDPM: condition = Tikhonov-реконструкция из измерения.
 
     Без conditioning Diffusion безполезен для нашей задачи (генерирует
@@ -461,7 +474,11 @@ def train_or_load_diffusion(y_train, X_train, SM,
 # --- Chae 2017 (single + multi layer) ---------------------------------------
 
 def train_or_load_chae(SM, image_shape, X_train, y_train,
-                       train: bool = True, epochs: int = 60):
+                       train: bool = True, epochs: int = 120):
+    # epochs повышен 60 → 120: Chae Multi-Layer достигает SSIM 0.98 на
+    # лёгких фантомах, но Single-Layer и Multi на сложных (rotation
+    # physical, shape_ring) проседает до 0.03-0.40. Сетка с sigmoid+MSE
+    # сходится медленно — 120 эпох даёт двойной запас.
     """Возвращает (single_layer_model, multi_layer_model) согласно статье."""
     print("\n  Chae (2017) — single + multi-layer FC...")
     in_dim = _model_input_dim(X_train)
@@ -521,9 +538,16 @@ def build_dip(image_shape):
 # --- PMCNet ablation sextet (data-free) ------------------------------------
 
 def build_pmcnet_variants(SM, image_shape,
-                           n_iterations: int = 1500,
+                           n_iterations: int = 3000,
                            init_tau_seconds: float = 1.0e-9,
                            scanner_h5_path: Optional[str] = None):
+    # n_iterations повышен 1500 → 3000: PMCNet-Paper и 4 ветки —
+    # test-time оптимизация со случайно инициализированным U-Net.
+    # На 1500 итерациях loss падает с 0.31 до 0.006, но качество
+    # ещё не доходит до плато (smoke-test показал SSIM 0.49-0.56).
+    # 3000 итераций дают двукратный запас и согласуются с paper
+    # Sec. III.B (20000 итераций — оригинал, но для compute-budget
+    # в дипломе 3000 — разумный компромисс).
     """Собрать шесть вариантов PMCNet для ablation-сравнения.
 
     Структура: одна общая «база» (PhysicsEnhanced) + три параллельные

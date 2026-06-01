@@ -156,14 +156,18 @@ class KatsMarcAlgorithm:
         self.row_norms_sq = row_norms_sq
         self.global_scale = scale
 
-    def reconstruct(self, measurement, n_iterations=20, relaxation=0.3,
+    def reconstruct(self, measurement, n_iterations=50, relaxation=0.3,
                     enforce_nonneg=True, damp_schedule=False):
         """Восстановление с защитой от шума.
 
         Kaczmarz без регуляризации деградирует на зашумлённых данных в
         semi-convergence — первые проходы улучшают качество, дальнейшие
         вшивают шум. Защита:
-          • `n_iterations=20` — баланс fit ↔ stop-before-noise;
+          • `n_iterations=50` — повышено 20 → 50: на предыдущем прогоне
+            Kaczmarz давал SSIM 0.01-0.03 (катастрофически), что говорит
+            о недо-итерациях. После исправления `_normalize_measurement`
+            (assert на длину b) ему нужно больше проходов для накопления
+            сигнала. 50 эпох × 2550 строк = 127K row-updates;
           • `relaxation=0.3` (под-релаксация) сглаживает каждый row-update;
           • строки A нормированы медианой ‖a_i‖ в `__init__`, b делится
             на тот же фактор в `_normalize_measurement` — это устраняет
