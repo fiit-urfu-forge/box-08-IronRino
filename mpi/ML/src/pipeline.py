@@ -908,7 +908,8 @@ def _load_real_measurement_b(
 
 def build_phantom_battery(SM_measured, image_shape,
                           snr_db: float = 30.0,
-                          random_seed: int = 0):
+                          random_seed: int = 0,
+                          scanner_h5_path: Optional[str] = None):
     """Сгенерировать батарею фантомов × методов для финального сравнения.
 
     Включены 5 синтетических 2D-фантомов + 1 реальное измерение:
@@ -956,11 +957,37 @@ def build_phantom_battery(SM_measured, image_shape,
         ('random',       pg.random_phantom(n_droplets=5)),
     ]
 
-    # Аналитическая SM той же формы, что измеренная
+    # Аналитическая SM той же формы, что измеренная.
+    # КРИТИЧНО: загружаем scanner-params + frequencies_hz из H5 чтобы
+    # analytical SM использовала ТЕ ЖЕ частоты, что и PMCNet-Paper
+    # (которая работает в explicit-DFT режиме). Иначе forward и
+    # measurement в разных частотных сетках → Paper не сходится.
     M_total = SM_measured.shape[0]
     print(f"  Сборка аналитической SM ({M_total}×{image_shape[0]*image_shape[1]})...")
-    cfg_phys = PMCNetConfig(image_size=tuple(image_shape))
-    SM_analytical = build_analytical_system_matrix(image_shape, M_total, cfg_phys)
+    if scanner_h5_path is not None:
+        try:
+            scanner = _load_scanner_params_from_h5(scanner_h5_path)
+            phys_freqs = scanner.pop('frequencies_hz')
+            cfg_phys = PMCNetConfig(image_size=tuple(image_shape), **scanner)
+            # n_meas_bins должно соответствовать числу H5-частот × 2
+            phys_n_meas = 2 * len(phys_freqs)
+            print(f"  [physical-SM] {len(phys_freqs)} H5-частот → "
+                  f"{phys_n_meas} бинов (вместо FFT-сетки)")
+            SM_analytical = build_analytical_system_matrix(
+                image_shape, phys_n_meas, cfg_phys,
+                frequencies_hz=phys_freqs,
+            )
+        except (FileNotFoundError, OSError) as e:
+            print(f"  [physical-SM] ⚠ H5 не загружен ({e}), FFT-режим")
+            cfg_phys = PMCNetConfig(image_size=tuple(image_shape))
+            SM_analytical = build_analytical_system_matrix(
+                image_shape, M_total, cfg_phys,
+            )
+    else:
+        cfg_phys = PMCNetConfig(image_size=tuple(image_shape))
+        SM_analytical = build_analytical_system_matrix(
+            image_shape, M_total, cfg_phys,
+        )
 
     # Для каждого синтетического фантома — два измерения (sm + physical)
     battery = []
@@ -1157,7 +1184,10 @@ def run_pipeline(num_samples: int = 5000, train_models: bool = True,
         cmp.set_moe(moe)
 
     # 3) Батарея фантомов × методов генерации
-    battery = build_phantom_battery(SM, image_shape, snr_db=30.0)
+    battery = build_phantom_battery(
+        SM, image_shape, snr_db=30.0,
+        scanner_h5_path='./../ChineseData/BeihangUniversityData/SystemMatrix.h5',
+    )
     synthetic_results = run_full_comparison(cmp, battery)
 
     # 4) OpenMPI-валидация (опционально, по флагу)

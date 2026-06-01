@@ -1406,39 +1406,50 @@ class BasicHardConstrainedSpectralForward(nn.Module):
         self.n_freq_per_coil = len(freqs)
         self.n_meas_bins = 2 * self.n_freq_per_coil
 
-        # ── Инициализация output_scale через kernel max ────────────────────
+        # ── Инициализация output_scale через kernel max (в float64) ────────
         # КРИТИЧЕСКИ ВАЖНО: НЕЛЬЗЯ использовать forward(c=ones) для
         # калибровки масштаба. В MPI равномерная концентрация даёт почти
         # нулевой сигнал (FFP проходит через +c и −c зоны симметрично,
         # вклады сокращаются). Это фундаментальное свойство, благодаря
         # которому MPI способен к локализации — и причина, по которой
-        # нормировка по uniform-c падала в floor 1e-30, ломая Paper.
+        # нормировка по uniform-c падала в floor 1e-30.
         #
         # Правильный подход (как в _setup_fft_scale): вычислить per-pixel
         # ядра K(r, t) = −μ₀·dA·s(r)·∂M(r,t)/∂t, взять их DFT на заданных
         # частотах, и нормировать max |K(r, f)|. Это масштаб системной
         # матрицы — он же ненулевой и для uniform-c кейса (где сигнал
         # = Σ_r K(r,f) = малое из-за интерференции).
+        #
+        # FLOAT64 ОБЯЗАТЕЛЕН: в SI-единицах MPI ядро ≈ μ₀·dA·∂M/∂t ~ 1e-25.
+        # После DFT (без · dt) → ~1e-23. Но `K.pow(2)` = ~1e-46, что ниже
+        # минимального нормального float32 (1.2e-38) → underflow в 0,
+        # и K_mag = 0 → output_scale = floor 1e-30 → forward в loss-плато.
+        # Расчёт в float64 обходит underflow; финальный scale хранится
+        # в float32 (нормализованные числа уже в пределах представимости).
         with torch.no_grad():
             Mx, My = self.physics._compute_magnetization()   # (Nx, Ny, T)
             dMx = self.physics.ddt(Mx)
             dMy = self.physics.ddt(My)
             s = self.physics.coil.sensitivity                  # (Nx, Ny)
             scale = -self.physics.langevin.mu0 * self.physics.dA
-            kx = scale * s.unsqueeze(-1) * dMx                 # (Nx, Ny, T)
-            ky = scale * s.unsqueeze(-1) * dMy
+            kx = (scale * s.unsqueeze(-1) * dMx).double()      # ← float64
+            ky = (scale * s.unsqueeze(-1) * dMy).double()      # ← float64
             T = kx.shape[-1]
             kx_flat = kx.reshape(-1, T)                        # (N_pixels, T)
             ky_flat = ky.reshape(-1, T)
+            dft_cos_64 = self.dft_cos.double()
+            dft_sin_64 = self.dft_sin.double()
             # DFT каждого per-pixel ядра на K заданных частотах
-            Kx_re = kx_flat @ self.dft_cos                     # (N, K)
-            Kx_im = -kx_flat @ self.dft_sin
-            Ky_re = ky_flat @ self.dft_cos
-            Ky_im = -ky_flat @ self.dft_sin
-            sm_max = torch.cat([
+            Kx_re = kx_flat @ dft_cos_64                       # (N, K)
+            Kx_im = -kx_flat @ dft_sin_64
+            Ky_re = ky_flat @ dft_cos_64
+            Ky_im = -ky_flat @ dft_sin_64
+            sm_max_64 = torch.cat([
                 (Kx_re.pow(2) + Kx_im.pow(2)).sqrt().flatten(),
                 (Ky_re.pow(2) + Ky_im.pow(2)).sqrt().flatten(),
             ]).max().clamp_min(1e-30)
+            # Конвертация обратно в float32 (значения уже нормальные)
+            sm_max = sm_max_64.float()
         self.register_buffer('output_scale', sm_max)
 
     @property
@@ -2034,10 +2045,16 @@ class PMCNetPaperReconstructor(_BaseReconstructor):
         torch.manual_seed(self.config.seed)
         z = torch.randn(1, 1, *self.image_shape, device=self.device)
 
-        # КАЛИБРОВКА output_scale: подгоняет масштаб forward под
-        # measurement до начала optimization. Без этого L1-loss
-        # сравнивает выходы разного порядка величины (см. анализ).
-        self.network.forward_op.calibrate_output_scale(u_real, u_imag)
+        # ОТКЛЮЧЕНО: calibrate_output_scale с Gaussian-blob target ломает
+        # physical-path. На physical-измерении SM_analytical и Paper.forward
+        # используют ИДЕНТИЧНУЮ нормировку (max|кернел|), поэтому
+        # output_scale_init = SM_norm_factor → forward(GT) = measurement
+        # точно (Loss(c=GT) ≈ 5e-6). Калибровка с blob сдвигает scale
+        # на 8%, и loss(GT) становится 0.06 вместо 0 → optimizer находит
+        # неправильное c. На sm-path калибровка тоже не помогает: модель
+        # фундаментально mismatch'нута с измеренной SM, ±8% масштаба
+        # ничего не лечит.
+        # self.network.forward_op.calibrate_output_scale(u_real, u_imag)
 
         optimizer = torch.optim.Adam(self.network.parameters(),
                                      lr=self.config.learning_rate)
@@ -2214,7 +2231,8 @@ class PMCNetHardConstrainedRefinedReconstructor(_BaseReconstructor):
 
 def build_analytical_system_matrix(image_shape: Tuple[int, int],
                                    n_meas_bins: int,
-                                   config: Optional[PMCNetConfig] = None
+                                   config: Optional[PMCNetConfig] = None,
+                                   frequencies_hz: Optional[np.ndarray] = None
                                    ) -> np.ndarray:
     """Построить аналитическую системную матрицу того же формата, что и
     измеренная (из калибровки сканера).
@@ -2226,30 +2244,62 @@ def build_analytical_system_matrix(image_shape: Tuple[int, int],
         u_n(t) = −μ₀ · dA · s(r_n) · ∂M(r_n, t)/∂t
 
     Поскольку M(r, t) общая для всех пикселей, всё семейство колонок
-    получается одним батчевым FFT — без циклов по пикселям, за O(N·T·logT).
+    получается одним батчевым FFT / DFT — без циклов по пикселям,
+    за O(N·T·logT) или O(N·T·K) соответственно.
 
     Возвращаемая матрица имеет форму `(n_meas_bins, Nx·Ny)` и совпадает
-    по схеме раскладки с измеренной SM из BeihangUniversityData
-    (см. `main.py`: `SM = S.reshape(2 · n_freq, n_pixels)`), что
-    обеспечивает прямую взаимозаменяемость в пайплайне.
+    по схеме раскладки с измеренной SM из BeihangUniversityData.
+
+    ## Два режима компиляции
+
+    **FFT-режим** (frequencies_hz=None): берёт первые `n_meas_bins/2`
+    бинов rfft по каждой катушке. Частоты равны k * (1 / (T·dt)),
+    что НЕ совпадает с реальными гармониками сканера. Подходит для
+    случаев, когда Paper тоже работает в FFT-режиме.
+
+    **DFT-режим** (frequencies_hz задан): вычисляет U(f_k) =
+    ∫ u(t)·exp(−j·2π·f_k·t) dt напрямую на ЗАДАННЫХ частотах. Это
+    КРИТИЧНО для согласования с PMCNet-Paper, который тоже работает
+    в DFT-режиме на этих же частотах. Без этого — измерение в одной
+    частотной сетке, forward в другой → Paper не может сойтись.
 
     Args:
         image_shape: (Nx, Ny).
         n_meas_bins: общее число строк (= 2 · число гармоник на катушку).
-        config:     PMCNetConfig с физическими параметрами. Параметр
-                    `n_time_samples` при необходимости поднимается так,
-                    чтобы rfft давал ≥ n_meas_bins/2 частотных бинов.
+        config:     PMCNetConfig с физическими параметрами.
+        frequencies_hz: (опц.) явные частоты для DFT-режима. Если задан,
+                        n_meas_bins должно быть = 2 · len(frequencies_hz).
     """
     base_cfg = config or PMCNetConfig(image_size=tuple(image_shape))
     n_freq_per_coil = n_meas_bins // 2
-    T_samples = max(base_cfg.n_time_samples, 2 * n_freq_per_coil)
+
+    use_dft = frequencies_hz is not None
+    if use_dft:
+        if 2 * len(frequencies_hz) != n_meas_bins:
+            raise ValueError(
+                f"n_meas_bins={n_meas_bins} должно быть 2*len(frequencies_hz)"
+                f"={2*len(frequencies_hz)}"
+            )
+
+    # Для FFT: повышаем T_samples под Nyquist. Для DFT: оставляем как есть.
+    if use_dft:
+        T_samples = base_cfg.n_time_samples
+    else:
+        T_samples = max(base_cfg.n_time_samples, 2 * n_freq_per_coil)
+
     cfg = PMCNetConfig(**{
         **base_cfg.__dict__,
         'image_size': tuple(image_shape),
         'n_time_samples': T_samples,
+        # КРИТИЧНО: paper-faithful настройки (uniform p, forward FD)
+        # ВНЕ ЗАВИСИМОСТИ от того, что было в base_cfg.
+        'use_radial_coil': False,
+        'use_central_fd': False,
+        'use_debye': False,
     })
 
-    physics = AnalyticalForwardModel(cfg)
+    # BasicAnalyticalForwardModel (paper-faithful), НЕ AnalyticalForwardModel.
+    physics = BasicAnalyticalForwardModel(cfg)
     physics.eval()
 
     with torch.no_grad():
@@ -2259,31 +2309,43 @@ def build_analytical_system_matrix(image_shape: Tuple[int, int],
         s = physics.coil.sensitivity                # (Nx, Ny)
         scale = -physics.langevin.mu0 * physics.dA
 
-        # u_n(t) для каждого пикселя как столбец: shape (Nx, Ny, T)
-        ux = scale * s.unsqueeze(-1) * dMx
-        uy = scale * s.unsqueeze(-1) * dMy
+        # u_n(t) — float64 для устойчивости pow(2) при нормировке
+        ux = (scale * s.unsqueeze(-1) * dMx).double()
+        uy = (scale * s.unsqueeze(-1) * dMy).double()
 
         Nx, Ny = image_shape
         N = Nx * Ny
         ux_flat = ux.reshape(N, T_samples)          # (N, T)
         uy_flat = uy.reshape(N, T_samples)
 
-        Ux = torch.fft.rfft(ux_flat, dim=-1)        # (N, T//2 + 1) complex
-        Uy = torch.fft.rfft(uy_flat, dim=-1)
+        if use_dft:
+            # Explicit DFT на заданных частотах — точно как в
+            # BasicHardConstrainedSpectralForward._setup_explicit_dft.
+            # U(f_k) = Σ_t u(t) · exp(−j·2π·f_k·t)
+            t = physics.ffp.t.double()                              # (T,)
+            freqs = torch.tensor(np.asarray(frequencies_hz).flatten(),
+                                  dtype=torch.float64)               # (K,)
+            arg = 2.0 * math.pi * t.unsqueeze(-1) * freqs.unsqueeze(0)
+            dft_cos = torch.cos(arg)                                 # (T, K)
+            dft_sin = torch.sin(arg)
+            # SM_x[k, n] = Σ_t u_x_n(t) · exp(−j 2π f_k t)
+            Ux_re = ux_flat @ dft_cos                                # (N, K)
+            Ux_im = -ux_flat @ dft_sin
+            Uy_re = uy_flat @ dft_cos
+            Uy_im = -uy_flat @ dft_sin
+            Ux = (Ux_re + 1j * Ux_im).to(torch.complex128)
+            Uy = (Uy_re + 1j * Uy_im).to(torch.complex128)
+            SM = torch.cat([Ux.T, Uy.T], dim=0)                      # (2K, N)
+        else:
+            Ux = torch.fft.rfft(ux_flat, dim=-1)                     # complex
+            Uy = torch.fft.rfft(uy_flat, dim=-1)
+            SM = torch.cat([
+                Ux[:, :n_freq_per_coil].T,
+                Uy[:, :n_freq_per_coil].T,
+            ], dim=0)                                                # (M, N)
 
-        # Берём n_freq_per_coil низших гармоник на каждую катушку
-        SM = torch.cat([
-            Ux[:, :n_freq_per_coil].T,              # (n_freq, N)
-            Uy[:, :n_freq_per_coil].T,
-        ], dim=0)                                    # (n_meas_bins, N)
-
-        # Нормировка до единичного максимума: физическая SM в СИ-единицах
-        # имеет порядок 10⁻²³ (μ₀·m_moment·dA), что в float32 ниже шума и
-        # не сопоставимо по масштабу с реальными измерениями. Абсолютная
-        # амплитуда SM произвольна (концентрация на выходе всё равно
-        # нормируется на [0, 1]); что физически значимо — это паттерн
-        # столбцов, который сохраняется при нормировке.
-        SM_max = SM.abs().max().clamp_min(1e-30)
+        # Нормировка до единичного максимума
+        SM_max = SM.abs().max().clamp_min(1e-300)
         SM = SM / SM_max
 
     return SM.cpu().numpy().astype(np.complex64)
