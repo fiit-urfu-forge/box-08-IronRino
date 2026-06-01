@@ -663,9 +663,8 @@ build_pmcnet_quartet = build_pmcnet_variants
 
 def build_moe(comparator, image_shape,
               X_train, y_train,
-              expert_names=('Тихонов', 'KatsMarc',
-                            'Chae(2017)', 'Chae-Multi(2017)',
-                            'CNN'),
+              expert_names=('Тихонов', 'Chae-Multi(2017)',
+                            'CNN', 'MoDL', 'DIP(2020)'),
               n_train_samples: int = 64,
               epochs: int = 30,
               mode: str = 'spatial'):
@@ -682,33 +681,35 @@ def build_moe(comparator, image_shape,
       4. Возвращаем готовый `MoEReconstructor`, чтобы подключить
          его в comparator.
 
-    ## Критерий отбора экспертов в default-списке
+    ## Состав экспертов в default-списке
 
-    В дефолт попали только модели, **быстрые на инференсе после
-    предобучения** (или вовсе не требующие обучения, как классические):
+    Выбраны модели с **наибольшим качеством** на прошлых прогонах,
+    охватывающие разные семейства методов:
 
-      • Тихонов, KatsMarc — без обучения, итеративный inference 2-10 с;
-      • Chae(2017) Single + Multi — FC-сети, ~5 мс на инференс;
-      • CNN (U-Net) — ~10 мс.
+      • **Тихонов** — классический regularization, baseline без обучения,
+        стабильно даёт SSIM ~0.7 на гладких фантомах;
+      • **Chae-Multi(2017)** — FC-сеть с hidden слоем, в прошлом прогоне
+        SOTA на sm-режиме (SSIM 0.98 на two_droplets);
+      • **CNN (U-Net)** — supervised post-processor, SSIM 0.43-0.49;
+      • **MoDL** — model-based unrolling, SSIM 0.55-0.96, очень быстрый;
+      • **DIP(2020)** — test-time training с early stopping, ~4-8 с на
+        сэмпл (прекомпьют 64 образцов ~5 минут), SSIM 0.30-0.90.
 
     НЕ в дефолте (по дизайну):
 
-      • **PMCNet × 4** — требуют 1500-3000 test-time-оптимизации,
+      • **KatsMarc** — на прошлом прогоне SSIM 0.01-0.03, его вклад в MoE
+        был бы шумовым (gating всё равно научится игнорировать);
+      • **Chae(2017) Single** — Multi-Layer бьёт Single везде, держать
+        обе — избыточная корреляция;
+      • **PMCNet × 4 + Paper** — требуют 3000-5000 test-time-оптимизаций,
         прекомпьют 1500+ сэмплов сделает сборку MoE 10+ часов;
-      • **DIP(2020)** — test-time-обучение (3000 итераций с early stop),
-        4-8 с на сэмпл → прекомпьют 64 образцов ~5 минут (ещё допустимо),
-        но эта схема концептуально data-free, а MoE — supervised;
       • **Diffusion** — DDPM-семпл 100 шагов = 13-18 с/сэмпл, прекомпьют
-        64 образцов ~15 минут. Можно добавить вручную: пройдёт в MoE,
-        но gating увидит этого эксперта как «медленный гладкий source»;
-      • **MoDL** — formально fast-after-pretraining (~50 мс), но
-        внутри уже содержит `(AᵀA+λI)⁻¹` data-consistency — то же, что
-        делает Tikhonov в MoE-наборе. На синтетических фантомах его
-        вклад сильно коррелирует с Tikhonov-экспертом → gating-сети
-        нечего разделять. Исключён, чтобы избежать избыточности.
+        64 образцов ~15 минут. Можно добавить вручную, но gating увидит
+        его как «медленный гладкий source».
 
-    Если хочется включить MoDL/PMCNet/DIP/Diffusion — передайте их в
-    `expert_names`. Имена совпадают с теми, что в таблице сравнения.
+    Если хочется добавить других экспертов (KatsMarc, Chae-Single,
+    PMCNet, Diffusion) — передайте их в `expert_names`. Имена
+    должны совпадать с теми, что в таблице сравнения.
     """
     print("\n" + "=" * 70)
     print(f"2.5. MIXTURE OF EXPERTS — комбинирование ({len(expert_names)} экспертов)")
