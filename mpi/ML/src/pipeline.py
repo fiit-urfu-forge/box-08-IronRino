@@ -115,16 +115,30 @@ def device():
 # ---------------------------------------------------------------------------
 
 
-def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True,
+def generate_synthetic_dataset(num_samples: int = 3000, save: bool = True,
                                 force_regenerate: bool = False):
     """Сгенерировать или загрузить датасеты двумя путями.
 
     При первом вызове: создаёт SM-путь и physical-путь, сохраняет на диск.
     При повторных: загружает сохранённые с диска, минуя дорогую генерацию.
 
+    ## Авто-регенерация при недостаточном кэше
+
+    Если кэшированный датасет на диске меньше **запрошенного num_samples
+    × 0.5** (учитываем train_split ≈ 0.8 → train ≈ 0.8·num_samples,
+    разрешаем 50% как нижний порог), автоматически вызывается регенерация.
+    Это лечит ситуацию, когда параметр поднимали, но кэш не пересчитали.
+
+    ## Размер physical-датасета
+
+    Для PHYS используется `min(1500, num_samples // 2)` — physical-форвард
+    в 3-5× медленнее SM-варианта (полная аналитическая физика на каждое
+    изображение). Раньше cap был 500 — теперь поднят до 1500, потому что
+    supervised-модели (CNN/MoDL/Diffusion) на 200 образцах сильно
+    недообучаются (это видно по SSIM 0.1-0.3 на physical-режиме).
+
     Args:
-        num_samples: размер SM-датасета (для PHYS используется
-                     min(500, num_samples//3) — physical-форвард медленнее).
+        num_samples: размер SM-датасета (для PHYS — min(1500, num_samples//2)).
         save: сохранять ли датасеты на диск при первой генерации.
         force_regenerate: если True, игнорирует сохранённые файлы и
                           генерирует заново. Полезно при изменении
@@ -147,27 +161,48 @@ def generate_synthetic_dataset(num_samples: int = 2000, save: bool = True,
     sm_prefix = './DATA/dataset/synthetic_complete'
     phys_prefix = './DATA/dataset/synthetic_physical'
 
+    # Запрошенные размеры train-split'ов (assuming test_split=0.2)
+    n_phys = min(1500, num_samples // 2)
+    sm_train_target = int(num_samples * 0.8)
+    phys_train_target = int(n_phys * 0.8)
+
     # --- Путь 1: SM-генерация ---
+    sm_cache_ok = False
     if not force_regenerate and SyntheticDatasetGenerator.dataset_exists(sm_prefix):
-        print(f"\n  Путь 1 (SM): загрузка из {sm_prefix}_*.npy ...")
-        dataset_sm = SyntheticDatasetGenerator.load_dataset(sm_prefix)
-        print(f"    загружено: {len(dataset_sm['X_train'])} train + "
-              f"{len(dataset_sm['X_test'])} test")
-    else:
-        print(f"\n  Путь 1 (SM): генерация {num_samples} образцов...")
+        cached = SyntheticDatasetGenerator.load_dataset(sm_prefix)
+        cached_train = len(cached['X_train'])
+        # Авто-регенерация если кэш < 50% запрошенного
+        if cached_train >= sm_train_target * 0.5:
+            print(f"\n  Путь 1 (SM): загрузка из {sm_prefix}_*.npy ...")
+            dataset_sm = cached
+            print(f"    загружено: {cached_train} train + "
+                  f"{len(dataset_sm['X_test'])} test")
+            sm_cache_ok = True
+        else:
+            print(f"\n  Путь 1 (SM): кэш мелкий ({cached_train} train < "
+                  f"50% от запрошенного {sm_train_target}) — регенерация...")
+    if not sm_cache_ok:
+        print(f"  Путь 1 (SM): генерация {num_samples} образцов...")
         dataset_sm = generator.create_training_pipeline_dataset(
             n_samples=num_samples, include_all_phantoms=True, save=save,
         )
 
     # --- Путь 2: physical-генерация ---
-    n_phys = min(500, num_samples // 3)
+    phys_cache_ok = False
     if not force_regenerate and SyntheticDatasetGenerator.dataset_exists(phys_prefix):
-        print(f"\n  Путь 2 (physical): загрузка из {phys_prefix}_*.npy ...")
-        dataset_phys = SyntheticDatasetGenerator.load_dataset(phys_prefix)
-        print(f"    загружено: {len(dataset_phys['X_train'])} train + "
-              f"{len(dataset_phys['X_test'])} test")
-    else:
-        print(f"\n  Путь 2 (physical): генерация {n_phys} образцов (медленнее)...")
+        cached = SyntheticDatasetGenerator.load_dataset(phys_prefix)
+        cached_train = len(cached['X_train'])
+        if cached_train >= phys_train_target * 0.5:
+            print(f"\n  Путь 2 (physical): загрузка из {phys_prefix}_*.npy ...")
+            dataset_phys = cached
+            print(f"    загружено: {cached_train} train + "
+                  f"{len(dataset_phys['X_test'])} test")
+            phys_cache_ok = True
+        else:
+            print(f"\n  Путь 2 (physical): кэш мелкий ({cached_train} train < "
+                  f"50% от запрошенного {phys_train_target}) — регенерация...")
+    if not phys_cache_ok:
+        print(f"  Путь 2 (physical): генерация {n_phys} образцов (медленнее)...")
         dataset_phys = generator.generate_dataset(
             n_samples=n_phys,
             method='physical',
@@ -1007,8 +1042,8 @@ def run_openmpi_validation(comparator):
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline(num_samples: int = 2000, train_models: bool = True,
-                 pmcnet_iterations: int = 1500,
+def run_pipeline(num_samples: int = 5000, train_models: bool = True,
+                 pmcnet_iterations: int = 3000,
                  validate_openmpi: bool = False,
                  force_regenerate_dataset: bool = False):
     """End-to-end вызов всего пайплайна.
@@ -1154,7 +1189,7 @@ def run_pipeline(num_samples: int = 2000, train_models: bool = True,
 
 def main():
     parser = argparse.ArgumentParser(description='MPI reconstruction pipeline')
-    parser.add_argument('--num_samples', type=int, default=2000,
+    parser.add_argument('--num_samples', type=int, default=5000,
                         help='Размер синтетического датасета')
     parser.add_argument('--train', action='store_true', default=True,
                         help='Обучать модели с нуля')
