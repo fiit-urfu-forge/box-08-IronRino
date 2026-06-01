@@ -1382,37 +1382,64 @@ class BasicHardConstrainedSpectralForward(nn.Module):
         Это эквивалентно ∫ u(t)·e^{−2πi f_k t} dt в дискретной форме.
         """
         t = self.physics.ffp.t                          # (T,) seconds
-        dt = (t[1] - t[0]).item()
         freqs = torch.tensor(np.asarray(frequencies_hz).flatten(),
                               dtype=torch.float32)        # (K,)
         # arg[t, k] = 2π f_k t — (T, K) тензор
         arg = 2.0 * math.pi * t.unsqueeze(-1) * freqs.unsqueeze(0)
-        self.register_buffer('dft_cos', torch.cos(arg) * dt)
-        self.register_buffer('dft_sin', torch.sin(arg) * dt)
+
+        # ── ВАЖНО: DFT-базис БЕЗ умножения на dt ────────────────────────
+        # Если умножать на dt = scan_duration/N_samples ~ 1e-7 с, то
+        # значения dft_cos/dft_sin ~ 1e-7. Per-pixel ядра физики
+        # μ₀·dA·∂M/∂t в SI-единицах ~ 1e-24. После DFT-свёртки
+        # получаем ~1e-24 · 1e-7 · N = 1e-28 → под float32 floor (1e-30),
+        # output_scale залипает в floor → forward даёт мусор → SSIM 0.09.
+        #
+        # FFT-режим работает потому, что `torch.fft.rfft` НЕ множит на dt
+        # (это чистая DFT-сумма, не интеграл-аппроксимация). Воспроизводим
+        # ту же нормировку: dft_cos[t,k] = cos(2π f_k t) без коэффициента.
+        # Финальный масштаб всё равно поглощается через output_scale,
+        # поэтому физическая интерпретация результата не меняется.
+        self.register_buffer('dft_cos', torch.cos(arg))
+        self.register_buffer('dft_sin', torch.sin(arg))
         # При explicit DFT n_freq_per_coil = len(frequencies_hz),
         # n_meas_bins = 2 × это значение
         self.n_freq_per_coil = len(freqs)
         self.n_meas_bins = 2 * self.n_freq_per_coil
 
-        # Инициализация output_scale: запускаем forward с c=1 и берём
-        # max |U(f)|. Это даёт scaled output порядка 1 для типичных
-        # входов, что нужно для float32 numerical stability при
-        # последующей калибровке против measurement.
+        # ── Инициализация output_scale через kernel max ────────────────────
+        # КРИТИЧЕСКИ ВАЖНО: НЕЛЬЗЯ использовать forward(c=ones) для
+        # калибровки масштаба. В MPI равномерная концентрация даёт почти
+        # нулевой сигнал (FFP проходит через +c и −c зоны симметрично,
+        # вклады сокращаются). Это фундаментальное свойство, благодаря
+        # которому MPI способен к локализации — и причина, по которой
+        # нормировка по uniform-c падала в floor 1e-30, ломая Paper.
+        #
+        # Правильный подход (как в _setup_fft_scale): вычислить per-pixel
+        # ядра K(r, t) = −μ₀·dA·s(r)·∂M(r,t)/∂t, взять их DFT на заданных
+        # частотах, и нормировать max |K(r, f)|. Это масштаб системной
+        # матрицы — он же ненулевой и для uniform-c кейса (где сигнал
+        # = Σ_r K(r,f) = малое из-за интерференции).
         with torch.no_grad():
-            c_unit = torch.ones(1, self.N)
-            c_img = c_unit.view(1, 1, self._Nx, self._Ny)
-            u_t = self.physics(c_img)                    # (1, 2, T)
-            # DFT inline (модули dft_cos/dft_sin уже на buffer):
-            Ux_re = u_t[:, 0] @ self.dft_cos
-            Ux_im = -u_t[:, 0] @ self.dft_sin
-            Uy_re = u_t[:, 1] @ self.dft_cos
-            Uy_im = -u_t[:, 1] @ self.dft_sin
-            U_mag = torch.cat([
-                (Ux_re.pow(2) + Ux_im.pow(2)).sqrt().flatten(),
-                (Uy_re.pow(2) + Uy_im.pow(2)).sqrt().flatten(),
-            ])
-            scale = U_mag.max().clamp_min(1e-30)
-        self.register_buffer('output_scale', scale)
+            Mx, My = self.physics._compute_magnetization()   # (Nx, Ny, T)
+            dMx = self.physics.ddt(Mx)
+            dMy = self.physics.ddt(My)
+            s = self.physics.coil.sensitivity                  # (Nx, Ny)
+            scale = -self.physics.langevin.mu0 * self.physics.dA
+            kx = scale * s.unsqueeze(-1) * dMx                 # (Nx, Ny, T)
+            ky = scale * s.unsqueeze(-1) * dMy
+            T = kx.shape[-1]
+            kx_flat = kx.reshape(-1, T)                        # (N_pixels, T)
+            ky_flat = ky.reshape(-1, T)
+            # DFT каждого per-pixel ядра на K заданных частотах
+            Kx_re = kx_flat @ self.dft_cos                     # (N, K)
+            Kx_im = -kx_flat @ self.dft_sin
+            Ky_re = ky_flat @ self.dft_cos
+            Ky_im = -ky_flat @ self.dft_sin
+            sm_max = torch.cat([
+                (Kx_re.pow(2) + Kx_im.pow(2)).sqrt().flatten(),
+                (Ky_re.pow(2) + Ky_im.pow(2)).sqrt().flatten(),
+            ]).max().clamp_min(1e-30)
+        self.register_buffer('output_scale', sm_max)
 
     @property
     def M(self) -> int:
@@ -1468,32 +1495,57 @@ class BasicHardConstrainedSpectralForward(nn.Module):
     def calibrate_output_scale(self, u_real: torch.Tensor,
                                 u_imag: torch.Tensor,
                                 typical_c: float = 0.5) -> float:
-        """Подогнать output_scale так, чтобы forward(c=typical) совпадал
+        """Подогнать output_scale так, чтобы forward(тестовый_c) совпадал
         по средней амплитуде с measurement.
 
-        Без этой калибровки `output_scale` имеет случайное значение
-        (max |ядро| или 1 для DFT), и L1-loss сравнивает выходы разного
-        порядка величины с измерением. После калибровки выход forward
-        для типичного c (≈ 0.5 после sigmoid) даёт ту же среднюю
-        |амплитуду|, что и measurement.
+        Без этой калибровки `output_scale` имеет нормировку «по максимуму
+        системного ядра» (см. `_setup_explicit_dft`/`_setup_fft_scale`),
+        что не привязано к амплитуде конкретного measurement. После
+        калибровки выход forward для типичного фантома даёт ту же
+        среднюю |амплитуду|, что и measurement → L1-loss сравнивает
+        выходы одного порядка величины.
+
+        ## Что используется как «тестовый фантом»
+
+        КРИТИЧЕСКИ ВАЖНО: НЕЛЬЗЯ использовать uniform-c для калибровки.
+        В MPI равномерная концентрация даёт почти нулевой сигнал (FFP
+        проходит через +c и −c зоны симметрично, контрибуции сокращаются).
+        До исправления тут стояло `c = 0.5 * ones`, что давало
+        pred_mag ≈ 0 → калибровка проваливалась → forward на огромный
+        делитель → loss-плато → SSIM 0.09 у Paper.
+
+        Решение: тестовый фантом = **гауссова капля в центре** —
+        концентрация неравномерная, отдалённо похожа на реальные фантомы,
+        даёт меняющийся вдоль FFP-трека сигнал (как реальный measurement).
 
         Args:
             u_real, u_imag: (M,) или (B, M) — measurement в частотной
                             области (как в reconstruct).
-            typical_c: ожидаемое типичное значение c (0.5 для sigmoid).
+            typical_c: пик гауссовой капли (default 0.5 — типичное
+                       значение после sigmoid).
         Returns:
             Финальное значение output_scale.
         """
         with torch.no_grad():
-            # Forward с c=typical_c (uniform)
-            c_unit = typical_c * torch.ones(1, self.N, device=u_real.device)
-            ur_pred, ui_pred = self.forward(c_unit)
+            # Гауссова капля в центре FOV — даёт ненулевой MPI-сигнал
+            # (в отличие от uniform-c). σ ≈ четверть от меньшей стороны.
+            device = u_real.device
+            xs = torch.arange(self._Nx, dtype=torch.float32, device=device)
+            ys = torch.arange(self._Ny, dtype=torch.float32, device=device)
+            X, Y = torch.meshgrid(xs, ys, indexing='ij')
+            cx, cy = (self._Nx - 1) / 2.0, (self._Ny - 1) / 2.0
+            sigma = max(min(self._Nx, self._Ny) / 4.0, 1.0)
+            blob = torch.exp(-((X - cx).pow(2) + (Y - cy).pow(2))
+                              / (2.0 * sigma * sigma))
+            blob = blob / blob.max() * typical_c                 # peak = typical_c
+            c_test = blob.view(1, -1)                            # (1, N)
+
+            ur_pred, ui_pred = self.forward(c_test)
             pred_mag = (ur_pred.pow(2) + ui_pred.pow(2)).sqrt().mean()
             meas_mag = (u_real.pow(2) + u_imag.pow(2)).sqrt().mean()
             if pred_mag > 1e-30 and meas_mag > 1e-30:
                 # output = raw / output_scale. Хотим: output_mag ≈ meas_mag
-                # значит: raw_mag / new_scale = meas_mag
-                #         new_scale = raw_mag / meas_mag = output_scale_old * pred_mag / meas_mag
+                #         new_scale = output_scale_old * pred_mag / meas_mag
                 ratio = (pred_mag / meas_mag).clamp(1e-6, 1e6)
                 self.output_scale.fill_(self.output_scale.item() * ratio.item())
         return float(self.output_scale.item())
