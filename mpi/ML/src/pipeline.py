@@ -1141,12 +1141,14 @@ def run_pipeline(num_samples: int = 5000, train_models: bool = True,
                                 kmax=20, n_val_samples=12)
     cmp.set_tikhonov_mu(best_mu)
 
-    # 2.5) MoE поверх быстрых экспертов
+    # 2.5) MoE поверх отобранных экспертов
+    # expert_names НЕ задаём явно — используем default из build_moe:
+    # ('Тихонов', 'Chae-Multi(2017)', 'CNN', 'MoDL', 'DIP(2020)').
+    # См. docstring build_moe — там же мотивация отбора каждой модели.
     moe = build_moe(
         comparator=cmp,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
-        expert_names=('Тихонов', 'KatsMarc', 'Chae(2017)', 'CNN'),
         n_train_samples=128,
         epochs=80,
         mode='spatial',
