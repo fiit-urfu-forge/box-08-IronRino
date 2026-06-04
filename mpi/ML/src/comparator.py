@@ -28,13 +28,14 @@
     • set_diffusion_model(trainer)  — DDPM baseline;
     • set_chae_model(model)         — Chae 2017 single-layer FC;
     • set_dip_model(model)          — Deep Image Prior;
-    • set_pmcnet_standard(...)      — PMCNet с измеренной SM;
-    • set_pmcnet_paper(...)         — PMCNet paper-faithful;
-    • set_pmcnet_radial_coil(...) — + физические улучшения;
-    • set_pmcnet_soft(...)          — Phys + soft constraints (Scheinker 2023);
-    • set_pmcnet_debye(...)         — Phys + Debye-релаксация (обучаемая τ);
-    • set_pmcnet_central_fd(...)    — Phys + центральная FD через Conv1d;
-    • set_moe(moe)                  — Mixture of Experts.
+    • set_pmcnet_standard(...)         — Std-baseline (S_measured · c);
+    • set_pmcnet_std_radial_coil(...)  — Std + radial coil correction;
+    • set_pmcnet_std_debye(...)        — Std + Debye-фильтр на u;
+    • set_pmcnet_std_soft(...)         — Std + soft penalty λ·‖∇c‖²;
+    • set_pmcnet_std_freq_weighted(...) — Std + freq-weighted L1 на u;
+    • set_pmcnet_all(...)              — Std + все 4 улучшения сразу;
+    • set_pmcnet_paper(...)            — Paper (физика напрямую, без матрицы);
+    • set_moe(moe) / set_moe_classical / set_moe_hybrid — Mixture of Experts.
 
   Метод, не зарегистрированный через сеттер, автоматически пропускается
   и помечается «ПРОПУЩЕН» в таблице.
@@ -83,16 +84,21 @@ class MPIReconstructionComparator:
         self.chae_model = None
         self.chae_multi_model = None  # Chae 2017 multi-layer вариант
         self.dip_model = None
-        # PMCNet (Huang et al., 2026) — три варианта в одной системе координат
-        self.pmcnet_standard = None                    # 1) измеренная SM (baseline)
-        self.pmcnet_paper = None                       # 2) paper-faithful (Huang 2026 Eq. 1-3)
-        self.pmcnet_radial_coil = None            # 3) paper + physical улучшения
-        self.pmcnet_soft = None                        # 4) Phys + Scheinker 2023 soft constraints
-        self.pmcnet_debye = None                       # 5) Phys + только Debye-релаксация
-        self.pmcnet_central_fd = None                  # 6) Phys + только центральная FD + TV
+        # PMCNet (Huang et al., 2026) — Std-ablation
+        self.pmcnet_standard = None                # 1) Std baseline (S_measured · c)
+        self.pmcnet_std_radial_coil = None         # 2) Std + radial coil
+        self.pmcnet_std_debye = None               # 3) Std + Debye-фильтр
+        self.pmcnet_std_soft = None                # 4) Std + soft penalty ‖∇c‖²
+        self.pmcnet_std_freq_weighted = None       # 5) Std + freq-weighted L1
+        self.pmcnet_all = None                     # 6) Std + все 4 улучшения
+        self.pmcnet_paper = None                   # 7) Paper (аналитическая физика)
 
-        # Mixture of Experts поверх остальных методов
-        self.moe = None
+        # Mixture of Experts: две независимые сборки
+        #   moe_classical — Тихонов + DIP + Chae-Multi
+        #   moe_hybrid    — MoDL + PMCNet-All
+        self.moe = None                                # legacy-алиас (для старого кода)
+        self.moe_classical = None
+        self.moe_hybrid = None
         self.katsmarc = self.katsmarc if hasattr(self, 'katsmarc') else None
 
         self.results = []
@@ -180,56 +186,80 @@ class MPIReconstructionComparator:
         """
         self.pmcnet_paper = reconstructor
 
-    def set_pmcnet_radial_coil(self, reconstructor):
-        """Вариант 3 — PMCNet-RadialCoil (Paper + ОДНО улучшение).
+    def set_pmcnet_std_radial_coil(self, reconstructor):
+        """Std + radial coil correction (ablation: только p(r))."""
+        self.pmcnet_std_radial_coil = reconstructor
 
-        Заменяет uniform p(r) ≡ 1 на радиальную чувствительность катушки
-        p(r) = 1/(1+(r/R)²). Никаких других изменений относительно
-        PMCNet-Paper. Параллельная ветка к Soft, Debye, CentralFD.
+    def set_pmcnet_std_debye(self, reconstructor):
+        """Std + Debye-фильтр (ablation: только частотный H_τ(f))."""
+        self.pmcnet_std_debye = reconstructor
+
+    def set_pmcnet_std_soft(self, reconstructor):
+        """Std + soft penalty (ablation: только λ·‖∇c‖²)."""
+        self.pmcnet_std_soft = reconstructor
+
+    def set_pmcnet_std_freq_weighted(self, reconstructor):
+        """Std + freq-weighted L1 (ablation: только w_k на L_data)."""
+        self.pmcnet_std_freq_weighted = reconstructor
+
+    def set_pmcnet_all(self, reconstructor):
+        """Std + все 4 улучшения сразу (radial coil + Debye + soft + freq-w).
+
+        Объединяет все совместимые с измеренной SM модификации:
+        coil-корректировку, частотный Debye-фильтр на u, L2-штраф на ∇c
+        и взвешивание гармоник по (k+1)^0.5. Используется как «потолок»
+        ablation-серии — чтобы видеть, насколько все улучшения вместе
+        поднимают качество относительно baseline и каждой одиночной
+        ветки.
         """
-        self.pmcnet_radial_coil = reconstructor
-
-    def set_pmcnet_soft(self, reconstructor):
-        """Вариант 4 — PMCNet-Soft (Phys + soft constraints, Scheinker 2023).
-
-        Добавляет к Phys ТОЛЬКО мягкие auxiliary loss'ы — L2-штраф на ∇c
-        (Scheinker Eq. 12-13) и частотно-взвешенный L1 на u. Без обучаемой
-        τ и multi-color. Изолирует вклад PINN-style soft constraints.
-        """
-        self.pmcnet_soft = reconstructor
-
-    def set_pmcnet_debye(self, reconstructor):
-        """Вариант 5 — PMCNet-Debye (Phys + только Debye-релаксация).
-
-        Добавляет к Phys ТОЛЬКО релаксацию Дебая (paper Eq. 4-5) с
-        обучаемой τ через softplus. Без multi-color, TV, soft-constraints,
-        central FD. Изолирует вклад модели инерции намагниченности частиц.
-        """
-        self.pmcnet_debye = reconstructor
-
-    def set_pmcnet_central_fd(self, reconstructor):
-        """Вариант 6 — PMCNet-CentralFD (Phys + только центральная FD).
-
-        Добавляет к Phys ТОЛЬКО более точную дискретизацию ∂M/∂t через
-        Conv1d с фиксированным ядром [−1, 0, +1]/(2Δt) — точность O(Δt²)
-        вместо O(Δt) у forward-FD в Phys. Изолирует эффект схемы
-        дискретизации производной (Maxwell-PCNN Eq. 12-13).
-        """
-        self.pmcnet_central_fd = reconstructor
+        self.pmcnet_all = reconstructor
 
     def set_moe(self, moe):
         """Установить Mixture of Experts поверх остальных методов.
 
         MoE сам внутри прогоняет всех своих экспертов и комбинирует их
-        выходы (через mean / scalar / spatial gating).
+        выходы (через mean / scalar / spatial gating). Сохраняется как
+        legacy-алиас `self.moe`; для двух раздельных сборок используйте
+        `set_moe_classical` / `set_moe_hybrid`.
         """
         self.moe = moe
 
+    def set_moe_classical(self, moe):
+        """MoE из классических/быстрых методов: Тихонов + DIP + Chae-Multi.
+
+        Все три эксперта не требуют физической модели сканера и работают
+        быстро (<10 сек/сэмпл). Подходят как «дешёвая» комбинация.
+        """
+        self.moe_classical = moe
+
+    def set_moe_hybrid(self, moe):
+        """MoE из гибридных физико-обучаемых методов: MoDL + PMCNet-All.
+
+        Оба эксперта используют физику измерения (системную матрицу) в
+        своём forward-операторе. Это даёт «дорогую» комбинацию с лучшей
+        устойчивостью к out-of-distribution данным.
+        """
+        self.moe_hybrid = moe
+
     def moe_reconstruction(self, measurement):
-        """Реконструкция через MoE: эксперты + комбинирование."""
+        """Реконструкция через legacy-MoE: эксперты + комбинирование."""
         if self.moe is None:
             raise ValueError("MoE модель не установлена")
         recon = self.moe.reconstruct(measurement)
+        return self._postprocess_recon(recon)
+
+    def moe_classical_reconstruction(self, measurement):
+        """Реконструкция через MoE-Classical (Тихонов + DIP + Chae-Multi)."""
+        if self.moe_classical is None:
+            raise ValueError("MoE-Classical модель не установлена")
+        recon = self.moe_classical.reconstruct(measurement)
+        return self._postprocess_recon(recon)
+
+    def moe_hybrid_reconstruction(self, measurement):
+        """Реконструкция через MoE-Hybrid (MoDL + PMCNet-All)."""
+        if self.moe_hybrid is None:
+            raise ValueError("MoE-Hybrid модель не установлена")
+        recon = self.moe_hybrid.reconstruct(measurement)
         return self._postprocess_recon(recon)
 
     def generate_test_case(self, radius=0.2, distance=0.2, intensity1=0.7, intensity2=0.7):
@@ -493,6 +523,16 @@ class MPIReconstructionComparator:
         )
         return self._postprocess_recon(recon)
 
+    def pmcnet_all_reconstruction(self, measurement, n_iterations=None):
+        """PMCNet-All: Std-форвард + Debye + radial coil + soft losses."""
+        if self.pmcnet_all is None:
+            raise ValueError("PMCNet-All модель не установлена")
+        u_complex = self._measurement_to_complex_vector(measurement)
+        recon = self.pmcnet_all.reconstruct(
+            u_complex, n_iterations=n_iterations, verbose=False,
+        )
+        return self._postprocess_recon(recon)
+
     # -- Вариант 2: PMCNet-Paper (paper-faithful, Huang 2026 Eq. 1-3) ---------
     def pmcnet_paper_reconstruction(self, measurement, n_iterations=None):
         """PMCNet-Paper: u = BasicAnalyticalForward(c), без улучшений.
@@ -511,77 +551,56 @@ class MPIReconstructionComparator:
         )
         return self._postprocess_recon(recon)
 
-    # -- Вариант 3: PMCNet-RadialCoil (Paper + только radial p(r)) ------------
-    def pmcnet_radial_coil_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-RadialCoil: Paper + ОДНО улучшение — радиальная p(r).
-
-        Заменяет uniform p(r) ≡ 1 на физически реалистичный профиль
-        p(r) = 1/(1+(|r|/R_coil)²). Всё остальное — paper-faithful.
-        Параллельная ветка Soft / Debye / CentralFD.
-        """
-        if self.pmcnet_radial_coil is None:
-            raise ValueError("PMCNet-RadialCoil модель не установлена")
+    # -- Std-ablation реконструкции ------------------------------------------
+    # Каждая накладывает ровно одно улучшение поверх S_measured · c, что
+    # позволяет напрямую измерить вклад каждого компонента (ablation).
+    def pmcnet_std_radial_coil_reconstruction(self, measurement, n_iterations=None):
+        """Std + radial coil correction (ablation: только p(r) на c до S·c)."""
+        if self.pmcnet_std_radial_coil is None:
+            raise ValueError("PMCNet-Std+RadialCoil модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
-        recon = self.pmcnet_radial_coil.reconstruct(
+        recon = self.pmcnet_std_radial_coil.reconstruct(
             u_complex, n_iterations=n_iterations, verbose=False,
         )
         return self._postprocess_recon(recon)
 
-    # -- Вариант 4: PMCNet-Soft (Paper + Scheinker soft constraints) ----------
-    def pmcnet_soft_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-Soft: Paper + ОДНО улучшение — Scheinker 2023 soft loss.
+    def pmcnet_std_debye_reconstruction(self, measurement, n_iterations=None):
+        """Std + Debye-фильтр H_τ(f) поверх S·c (ablation: только τ).
 
-        Forward тот же, что у PMCNet-Paper (uniform p(r), forward-FD).
-        В loss добавлены два auxiliary штрафа:
-          • λ_grad · ‖∇c‖₂² (Scheinker 2023, Eq. 12-13);
-          • frequency-weighted L1 на u_real/u_imag.
-
-        Никаких изменений в forward-операторе.
+        Оценённое τ доступно через
+        `self.pmcnet_std_debye.network.debye.tau_seconds`.
         """
-        if self.pmcnet_soft is None:
-            raise ValueError("PMCNet-Soft модель не установлена")
+        if self.pmcnet_std_debye is None:
+            raise ValueError("PMCNet-Std+Debye модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
-        recon = self.pmcnet_soft.reconstruct(
+        recon = self.pmcnet_std_debye.reconstruct(
             u_complex, n_iterations=n_iterations, verbose=False,
         )
-        return self._postprocess_recon(recon)
-
-    # -- Вариант 5: PMCNet-Debye (Phys + только Debye-релаксация) -------------
-    def pmcnet_debye_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-Debye: Phys + обучаемая Debye-релаксация (без multi-color, без TV).
-
-        Оценённое τ доступно через `self.pmcnet_debye.network.debye.tau_seconds`
-        для отчёта (в отличие от прежнего PMCNet-Final, где τ возвращалось
-        вторым элементом кортежа — теперь reconstruct() даёт чистый image).
-        """
-        if self.pmcnet_debye is None:
-            raise ValueError("PMCNet-Debye модель не установлена")
-        u_complex = self._measurement_to_complex_vector(measurement)
-        recon = self.pmcnet_debye.reconstruct(
-            u_complex, n_iterations=n_iterations, verbose=False,
-        )
-        # Сохраним τ для отчёта (single-color → один скаляр)
         try:
             self.last_pmcnet_taus_seconds = (
-                self.pmcnet_debye.network.debye.tau_seconds
+                self.pmcnet_std_debye.network.debye.tau_seconds
                 .detach().cpu().numpy()
             )
         except AttributeError:
             self.last_pmcnet_taus_seconds = None
         return self._postprocess_recon(recon)
 
-    # -- Вариант 6: PMCNet-CentralFD (Phys + только central FD) ---------------
-    def pmcnet_central_fd_reconstruction(self, measurement, n_iterations=None):
-        """PMCNet-CentralFD: Phys + центральная разность через Conv1d.
-
-        Всё то же, что у PhysicsEnhanced, но с точностью O(Δt²) у
-        производной ∂M/∂t. Симметричное ядро [−1, 0, +1]/(2Δt) реализовано
-        фиксированным Conv1d без обучаемых весов.
-        """
-        if self.pmcnet_central_fd is None:
-            raise ValueError("PMCNet-CentralFD модель не установлена")
+    def pmcnet_std_soft_reconstruction(self, measurement, n_iterations=None):
+        """Std + soft penalty λ·‖∇c‖² (ablation: только prior на gradient картинки)."""
+        if self.pmcnet_std_soft is None:
+            raise ValueError("PMCNet-Std+Soft модель не установлена")
         u_complex = self._measurement_to_complex_vector(measurement)
-        recon = self.pmcnet_central_fd.reconstruct(
+        recon = self.pmcnet_std_soft.reconstruct(
+            u_complex, n_iterations=n_iterations, verbose=False,
+        )
+        return self._postprocess_recon(recon)
+
+    def pmcnet_std_freq_weighted_reconstruction(self, measurement, n_iterations=None):
+        """Std + частотно-взвешенный L1 на u (ablation: только w_k на L_data)."""
+        if self.pmcnet_std_freq_weighted is None:
+            raise ValueError("PMCNet-Std+FreqWeighted модель не установлена")
+        u_complex = self._measurement_to_complex_vector(measurement)
+        recon = self.pmcnet_std_freq_weighted.reconstruct(
             u_complex, n_iterations=n_iterations, verbose=False,
         )
         return self._postprocess_recon(recon)
@@ -885,23 +904,35 @@ class MPIReconstructionComparator:
              "Dittmer et al."),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
-             "Huang et al. - Standard"),
-            ('PMCNet-RadialCoil(2026)',
-             self.pmcnet_radial_coil_reconstruction if self.pmcnet_radial_coil else None,
-             "Paper + radial p(r) = 1/(1+(r/R)²)"),
-            ('PMCNet-Soft(2026)',
-             self.pmcnet_soft_reconstruction if self.pmcnet_soft else None,
-             "Phys + Scheinker 2023 soft constraints"),
-            ('PMCNet-Debye(2026)',
-             self.pmcnet_debye_reconstruction if self.pmcnet_debye else None,
-             "Phys + Debye-релаксация (обучаемая τ)"),
-            ('PMCNet-CentralFD(2026)',
-             self.pmcnet_central_fd_reconstruction if self.pmcnet_central_fd else None,
-             "Phys + центральная FD (O(Δt²))"),
+             "Huang et al. - Std baseline (S_measured · c)"),
+            ('PMCNet-Std+RadialCoil(2026)',
+             self.pmcnet_std_radial_coil_reconstruction if self.pmcnet_std_radial_coil else None,
+             "Std + radial coil correction p(r)"),
+            ('PMCNet-Std+Debye(2026)',
+             self.pmcnet_std_debye_reconstruction if self.pmcnet_std_debye else None,
+             "Std + Debye-фильтр H_τ(f) поверх S·c"),
+            ('PMCNet-Std+Soft(2026)',
+             self.pmcnet_std_soft_reconstruction if self.pmcnet_std_soft else None,
+             "Std + soft penalty λ·‖∇c‖²"),
+            ('PMCNet-Std+FreqW(2026)',
+             self.pmcnet_std_freq_weighted_reconstruction if self.pmcnet_std_freq_weighted else None,
+             "Std + freq-weighted L1 на u"),
+            ('PMCNet-All(2026)',
+             self.pmcnet_all_reconstruction if self.pmcnet_all else None,
+             "Std + все 4 улучшения сразу"),
+            ('PMCNet-Paper(2026)',
+             self.pmcnet_paper_reconstruction if self.pmcnet_paper else None,
+             "Paper-faithful (физика напрямую, без матрицы)"),
             ('CNN', self.cnn_reconstruction if hasattr(self, 'cnn_trainer') and self.cnn_trainer else None, "CNN"),
             ('MoDL', self.modl_reconstruction if hasattr(self, 'modl_trainer') and self.modl_trainer else None, "MoDL"),
+            ('MoE-Classical',
+             self.moe_classical_reconstruction if self.moe_classical else None,
+             "MoE: Тихонов + DIP + Chae-Multi"),
+            ('MoE-Hybrid',
+             self.moe_hybrid_reconstruction if self.moe_hybrid else None,
+             "MoE: MoDL + PMCNet-All"),
             ('MoE', self.moe_reconstruction if self.moe else None,
-             "Mixture of Experts (per-pixel gating)"),
+             "Mixture of Experts (legacy)"),
         ]
 
         openmpi_results = {}
@@ -1032,27 +1063,36 @@ class MPIReconstructionComparator:
              "Dittmer et al. - Deep Image Prior"),
             ('PMCNet-Std(2026)',
              self.pmcnet_standard_reconstruction if self.pmcnet_standard else None,
-             "Huang et al. - SM-baseline (измеренная SM)"),
+             "Huang et al. - Std baseline (S_measured · c)"),
+            ('PMCNet-Std+RadialCoil(2026)',
+             self.pmcnet_std_radial_coil_reconstruction if self.pmcnet_std_radial_coil else None,
+             "Std + radial coil correction p(r)"),
+            ('PMCNet-Std+Debye(2026)',
+             self.pmcnet_std_debye_reconstruction if self.pmcnet_std_debye else None,
+             "Std + Debye-фильтр H_τ(f) поверх S·c"),
+            ('PMCNet-Std+Soft(2026)',
+             self.pmcnet_std_soft_reconstruction if self.pmcnet_std_soft else None,
+             "Std + soft penalty λ·‖∇c‖²"),
+            ('PMCNet-Std+FreqW(2026)',
+             self.pmcnet_std_freq_weighted_reconstruction if self.pmcnet_std_freq_weighted else None,
+             "Std + freq-weighted L1 на u"),
+            ('PMCNet-All(2026)',
+             self.pmcnet_all_reconstruction if self.pmcnet_all else None,
+             "Std + все 4 улучшения сразу"),
             ('PMCNet-Paper(2026)',
              self.pmcnet_paper_reconstruction if self.pmcnet_paper else None,
-             "Huang et al. - paper-faithful (явная физика)"),
-            ('PMCNet-RadialCoil(2026)',
-             self.pmcnet_radial_coil_reconstruction if self.pmcnet_radial_coil else None,
-             "Paper + radial p(r) = 1/(1+(r/R)²)"),
-            ('PMCNet-Soft(2026)',
-             self.pmcnet_soft_reconstruction if self.pmcnet_soft else None,
-             "Phys + Scheinker 2023 soft (∇c² + freq-weighted L1)"),
-            ('PMCNet-Debye(2026)',
-             self.pmcnet_debye_reconstruction if self.pmcnet_debye else None,
-             "Phys + Debye-релаксация (обучаемая τ)"),
-            ('PMCNet-CentralFD(2026)',
-             self.pmcnet_central_fd_reconstruction if self.pmcnet_central_fd else None,
-             "Phys + центральная FD через Conv1d (O(Δt²))"),
+             "Paper-faithful (физика напрямую, без матрицы)"),
             ('CNN', self.cnn_reconstruction if self.cnn_trainer else None, "CNN (UNet)"),
             ('MoDL', self.modl_reconstruction if self.modl_trainer else None, "MoDL Network"),
             ('Diffusion', self.diffusion_reconstruction if self.diffusion_trainer else None, "Diffusion Model"),
+            ('MoE-Classical',
+             self.moe_classical_reconstruction if self.moe_classical else None,
+             "MoE: Тихонов + DIP + Chae-Multi (быстрые классические)"),
+            ('MoE-Hybrid',
+             self.moe_hybrid_reconstruction if self.moe_hybrid else None,
+             "MoE: MoDL + PMCNet-All (физико-обучаемые гибриды)"),
             ('MoE', self.moe_reconstruction if self.moe else None,
-             "Mixture of Experts (комбинирование моделей)"),
+             "Mixture of Experts (legacy-комбинация)"),
         ]
 
         print(f"\n{'Метод':<15} {'Источник':<35} {'SSIM':<8} {'PSNR (дБ)':<12} {'FWHM':<8} {'Время (с)':<10}")
@@ -1077,7 +1117,19 @@ class MPIReconstructionComparator:
                     print(f"  {name}: Ошибка - некорректный результат")
                     continue
 
-                metrics = MetricsCalculator.calculate_all_metrics(original_image, recon)
+                if original_image is None:
+                    # Реальное измерение без ground-truth (например,
+                    # буква со сканера). SSIM/PSNR/MSE требуют пару
+                    # (GT, recon) — даём NaN, FWHM считается по recon.
+                    metrics = {
+                        'ssim': float('nan'),
+                        'psnr': float('nan'),
+                        'mse': float('nan'),
+                        'fwhm': MetricsCalculator.calculate_fwhm(recon),
+                    }
+                else:
+                    metrics = MetricsCalculator.calculate_all_metrics(
+                        original_image, recon)
                 metrics['time'] = elapsed_time
 
                 results[name] = {
@@ -1110,8 +1162,15 @@ class MPIReconstructionComparator:
         # Для legacy-визуализации передадим radius/distance, если они есть
         radius = metadata.get('radius', 0.0)
         distance = metadata.get('distance', 0.0)
+        # Если ground-truth отсутствует (реальные letter-измерения со
+        # сканера) — подставляем нулевую заглушку, чтобы legacy-функция
+        # не падала на `original - recon`. На картинке «оригинал» будет
+        # пустым, что и соответствует «GT недоступен».
+        gt_for_plot = (original if original is not None
+                       else np.zeros(next(iter(results.values()))['image'].shape,
+                                     dtype=np.float32))
         Visualization.plot_all_methods_comparison(
-            original, results, radius, distance,
+            gt_for_plot, results, radius, distance,
             save_path=save_path, show_plot=False
         )
 
@@ -1121,20 +1180,21 @@ class MPIReconstructionComparator:
         print("ПОЛНОЕ СРАВНЕНИЕ МЕТОДОВ РЕКОНСТРУКЦИИ MPI")
         print("=" * 90)
         print("\nСравниваемые методы и их источники:")
-        print("  1. Тихонов              - Tikhonov regularization (1963)")
-        print("  2. KatsMarc             - Kaczmarz algorithm (1937) - ART")
-        print("  3. Chae(2017)           - Single-layer FC NN (ETRI Journal)")
-        print("  4. DIP(2020)            - Deep Image Prior (Dittmer et al.)")
-        print("  5. PMCNet-Std(2026)        - PMCNet Standard, измеренная SM (Huang et al.)")
-        print("  6. PMCNet-Paper(2026)      - PMCNet paper-faithful (явная физика)")
-        print("  7. PMCNet-RadialCoil(2026) - Paper + radial p(r)")
-        print("  8. PMCNet-Soft(2026)       - Paper + Scheinker 2023 soft constraints")
-        print("  9. PMCNet-Debye(2026)      - Paper + Debye-релаксация (обучаемая τ)")
-        print(" 10. PMCNet-CentralFD(2026)  - Paper + центральная FD (O(Δt²))")
-        print(" 11. CNN                     - U-Net baseline")
-        print(" 12. MoDL                    - Model-based Deep Learning")
-        print(" 13. Diffusion               - DDPM baseline")
-        print(" 14. MoE                     - Mixture of Experts (комбинирование моделей)")
+        print("  1. Тихонов                       - Tikhonov regularization (1963)")
+        print("  2. KatsMarc                      - Kaczmarz algorithm (1937) - ART")
+        print("  3. Chae(2017)                    - Single-layer FC NN (ETRI Journal)")
+        print("  4. DIP(2020)                     - Deep Image Prior (Dittmer et al.)")
+        print("  5. PMCNet-Std(2026)              - Std baseline, S_measured · c")
+        print("  6. PMCNet-Std+RadialCoil(2026)   - Std + radial coil correction")
+        print("  7. PMCNet-Std+Debye(2026)        - Std + Debye-фильтр H_τ(f)")
+        print("  8. PMCNet-Std+Soft(2026)         - Std + soft penalty λ·‖∇c‖²")
+        print("  9. PMCNet-Std+FreqW(2026)        - Std + freq-weighted L1")
+        print(" 10. PMCNet-All(2026)              - Std + все 4 улучшения")
+        print(" 11. PMCNet-Paper(2026)            - Paper (физика напрямую)")
+        print(" 12. CNN                            - U-Net baseline")
+        print(" 13. MoDL                           - Model-based Deep Learning")
+        print(" 14. Diffusion                       - DDPM baseline")
+        print(" 15. MoE / MoE-Classical / MoE-Hybrid - Mixture of Experts")
         print("=" * 90)
 
         all_results = []

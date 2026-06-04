@@ -35,46 +35,41 @@
 тренировочного датасета); физика встроена в loss → реконструкция
 физически согласована.
 
-## Четыре варианта в этом модуле
+## Pipeline-ready варианты в этом модуле
 
-  PMCNetStandard          — SM-baseline (НЕ paper-faithful). Прямой оператор
-                            P(c) = S_measured · c, где S_measured —
-                            калибровочная матрица сканера, измеренная
-                            заранее на сетке дельта-фантомов. Сохранён
-                            для сравнения. Paper-вариант избегает SM.
+Главная линейка — ablation поверх Std-baseline (измеренная SM сканера).
+Paper-вариант оставлен как отдельный «эталон без матрицы» для прямого
+сравнения «матричный vs аналитический форвард».
+
+  PMCNetStandard          — Std-baseline. Прямой оператор P(c) = S_measured · c,
+                            где S_measured — калибровочная матрица сканера.
+                            Без улучшений.
+
+  PMCNetStdRadialCoil     — Std + поэлементная радиальная коррекция
+                            p(r) = 1/(1+(r/R)²) на концентрации перед S·c.
+                            R обучается через softplus(raw_R).
+
+  PMCNetStdDebye          — Std + частотный фильтр H_τ(f) = 1/(1+j·2π·f·τ)
+                            поверх S·c. τ обучается через softplus(raw_τ).
+
+  PMCNetStdSoft           — Std + soft penalty λ·‖∇c‖² на пространственный
+                            градиент картинки (Scheinker 2023, Eq. 12-13).
+                            Forward не меняется, добавляется только prior.
+
+  PMCNetStdFreqWeighted   — Std + частотно-взвешенный L1 на u_real/u_imag.
+                            Веса w_k = (k+1)^0.5 компенсируют падение
+                            амплитуды гармоник ~1/k.
+
+  PMCNetAll               — Std + все 4 улучшения сразу (radial coil + Debye
+                            + soft penalty + freq-weighted L1).
 
   PMCNetPaper             — paper-faithful. Физика вычисляется явно из
-                            физических параметров (драйв-частоты,
-                            градиент, амплитуда поля, диаметр частиц,
-                            температура) — без измеренной SM. Соответствует
+                            физических параметров (драйв-частоты, градиент,
+                            амплитуда поля, диаметр частиц, температура) —
+                            без какой-либо системной матрицы. Соответствует
                             идее статьи: «параметры сканера известны,
-                            калибровка не нужна».
-
-  PMCNetPhysicsEnhanced   — paper + два физических улучшения:
-                            * радиальная чувствительность катушки
-                              p(r) = 1/(1+(r/R)²) вместо uniform p(r)≡1
-                              (в реальности приёмная катушка ловит сигнал
-                              слабее на краях FOV);
-                            * langevin_safe — численно-устойчивая функция
-                              Ланжевена с разложением Тейлора при малых
-                              аргументах (защита от NaN в float32).
-
-  PMCNetSoftConstrained   — PhysicsEnhanced + soft-constraints из
-                            Scheinker 2023 (PCNN):
-                            * λ_grad · ‖∇c‖₂² — L2-штраф на пространственный
-                              градиент c через central-FD ядро;
-                            * частотно-взвешенный L1 на u — компенсирует
-                              падение амплитуды гармоник как ~1/k.
-
-  PMCNetDebye             — PhysicsEnhanced + ОДНО ML-улучшение:
-                            релаксация Дебая (paper Eq. 4-5) как
-                            частотный фильтр H_τ(f) = 1/(1+j·2π·f·τ)
-                            с обучаемой τ через softplus(raw_τ).
-
-  PMCNetCentralFD         — PhysicsEnhanced + ОДНО физ. улучшение:
-                            центральная разность ∂M/∂t через Conv1d
-                            с ядром [-1,0,+1]/(2Δt), точность O(Δt²)
-                            (Maxwell-PCNN Eq. 12-13).
+                            калибровка не нужна». Не используется как база
+                            для ablation в текущем пайплайне.
 
 ## Иерархия классов
 
@@ -84,7 +79,7 @@
     BasicAnalyticalForwardModel    — paper-faithful u(t) = -μ₀·∫s·∂M/∂t·c dr
     BasicHardConstrainedSpectralForward — FFT/DFT обёртка
 
-  Физические примитивы (улучшенные):
+  Физические примитивы (улучшенные, для PMCNet-Enhanced):
     RadialCoilSensitivity          — p(r) = 1/(1+(r/R)²), R может обучаться
     TimeDerivativeFD               — central FD через Conv1d, O(Δt²)
     AnalyticalForwardModel         — то же что Basic + улучшения
@@ -95,20 +90,16 @@
     DebyeRelaxationFilter, SystemMatrixForward
 
   Высокоуровневые nn.Module:
-    PMCNet, PMCNetWithBasicPhysics, PMCNetHardConstrained,
-    PMCNetHardConstrainedRefined, PMCNetUNet
+    PMCNet (Std-baseline),
+    PMCNetEnhanced (Std + опциональные radial coil / Debye / soft / freq-w),
+    PMCNetWithBasicPhysics (для PMCNetPaper),
+    PMCNetHardConstrained, PMCNetHardConstrainedRefined (для legacy/тестов),
+    PMCNetUNet.
 
   Reconstructor'ы (data-free per-measurement optimization):
-    PMCNetReconstructor (base for Standard),
-    PMCNetPaperReconstructor (base for Paper),
-    PMCNetHardConstrainedReconstructor (base for PhysicsEnhanced,
-        Soft, CentralFD — все используют HardConstrainedSpectralForward),
-    PMCNetHardConstrainedRefinedReconstructor (base for Debye —
-        тот же forward + DebyeRelaxationFilter).
-
-  Pipeline-ready user-facing:
-    PMCNetStandard, PMCNetPaper, PMCNetPhysicsEnhanced [= база Phys],
-    PMCNetSoftConstrained, PMCNetDebye, PMCNetCentralFD.
+    PMCNetReconstructor       — база для PMCNetStandard,
+    PMCNetEnhancedReconstructor — база для всех Std-улучшений и PMCNetAll,
+    PMCNetPaperReconstructor   — база для PMCNetPaper.
 """
 
 import math
@@ -171,23 +162,24 @@ class PMCNetConfig:
     # Все три флага независимо переключаются — позволяет конструировать
     # PMCNet-вариант с любой комбинацией. По умолчанию ВСЕ False —
     # это paper-faithful поведение (`PMCNetPaper`). Каждый из четырёх
-    # named-вариантов (RadialCoil, Soft, Debye, CentralFD) включает
-    # РОВНО ОДНО из улучшений, чтобы изолировать его вклад.
+    # одиночных Std-вариантов включает РОВНО ОДНО из улучшений,
+    # чтобы изолировать его вклад.
 
     # 2a. Радиальная чувствительность катушки p(r) = 1/(1+(r/R_coil)²)
     # вместо uniform p(r) ≡ 1. По умолчанию False (paper-faithful uniform).
-    # Используется `PMCNetRadialCoil`.
+    # Включается в `PMCNetStdRadialCoil` и `PMCNetAll`.
     use_radial_coil: bool = False
 
-    # 2b. Схема ∂M/∂t для аналитического оператора:
+    # 2b. Схема ∂M/∂t для аналитического Paper-оператора (на Std-форварде
+    # не применяется — у измеренной SM производная уже зашита численно):
     #   True  → центральная разность через Conv1d [-1, 0, +1]/(2Δt) — O(Δt²)
     #   False → forward-FD [-1, +1]/Δt — O(Δt) (paper-faithful)
-    # Используется `PMCNetCentralFD`.
     use_central_fd: bool = False
 
     # 2c. Релаксация Дебая (paper Eq. 4–5) как частотный фильтр
     # H_τ(f) = 1/(1+j·2π·f·τ), применяемый к выходу forward-оператора.
-    # τ обучаемая через softplus(raw_τ). Используется `PMCNetDebye`.
+    # τ обучаемая через softplus(raw_τ). Включается в `PMCNetStdDebye`
+    # и `PMCNetAll`.
     use_debye: bool = False
     # Начальное τ для Дебая (с). 1 нс делает фильтр практически прозрачным
     # до 1 МГц; раньше было 2 мкс, что убивало высокие гармоники до 10%.
@@ -421,7 +413,7 @@ class DebyeRelaxationFilter(nn.Module):
       даёт u(t) явно.
     • **Частотная фильтрация** (`freq_response`): сигнал уже в частотной
       области U(f), умножается на H(f). Эффективнее, используется в
-      PMCNetDebye где FFT всё равно делается для применения H_τ(f).
+      PMCNetEnhanced (Std + Debye) где FFT всё равно делается для H_τ(f).
 
     Args:
         n_colors: число типов МНЧ (multi-color MPI). Default 1.
@@ -1044,14 +1036,13 @@ class BasicAnalyticalForwardModel(nn.Module):
                 профиль приёмной катушки);
         True  → `RadialCoilSensitivity`, p(r) = 1/(1+(r/R)²) — радиальная
                 чувствительность, моделирующая ослабление сигнала на
-                краях FOV (улучшение для `PMCNetRadialCoil`).
+                краях FOV.
 
     ▸ `use_central_fd` (default False = paper-faithful):
         False → `TimeDerivativeForwardFD`, ∂/∂t = (M[t+1] − M[t])/Δt,
                 точность O(Δt) — буквально theory.md Eq. derivative;
         True  → `TimeDerivativeFD` через Conv1d с ядром [−1, 0, +1]/(2Δt),
-                точность O(Δt²) — улучшение для `PMCNetCentralFD`
-                (Maxwell-PCNN Eq. 12-13).
+                точность O(Δt²), Maxwell-PCNN Eq. 12-13.
 
     Релаксация Дебая (use_debye) применяется НЕ здесь, а на уровне
     `BasicHardConstrainedSpectralForward` (post-multiplication на H_τ(f)
@@ -1331,7 +1322,7 @@ class BasicHardConstrainedSpectralForward(nn.Module):
 
         # Опциональная Debye-релаксация (применяется в частотной области
         # к выходу _после_ FFT/DFT). Single-color: один τ для всего сигнала.
-        # Активируется через cfg.use_debye → `PMCNetDebye`.
+        # Активируется через cfg.use_debye (Std-ветка: PMCNetStdDebye / PMCNetAll).
         self.use_debye = bool(cfg.use_debye)
         if self.use_debye:
             self.debye = DebyeRelaxationFilter(
@@ -1679,6 +1670,118 @@ class PMCNet(nn.Module):
         return c, u_real, u_imag
 
 
+class PMCNetEnhanced(nn.Module):
+    """PMCNet поверх ИЗМЕРЕННОЙ SM (`SystemMatrixForward`) + улучшения.
+
+    Базовая ветка та же, что в `PMCNet`: φ_θ(z) → c → S·c → (u_real, u_imag).
+    Поверх неё опционально применяются ОБЪЕДИНЯЕМЫЕ независимыми флагами
+    config'а улучшения, физически совместимые с матричным форвардом:
+
+      ▸ `use_radial_coil` — мультипликативная коррекция концентрации
+        пиксельной картой p(r) = 1/(1+(r/R)²) ПЕРЕД S·c. Эквивалентно
+        предположению «измеренная SM собрана с идеальной катушкой, а
+        реальный спад на краях нужно учесть отдельно». R обучается
+        через softplus(raw_R), когда `learn_coil_radius=True`.
+
+      ▸ `use_debye` — частотный фильтр H_τ(f) = 1/(1+j·2π·f·τ) поверх
+        выхода S·c. τ обучается через `DebyeRelaxationFilter`. Для этого
+        нужны частоты гармоник `harmonic_frequencies_hz` (берём из H5
+        `frequencySelection` сканера).
+
+      ▸ Soft-constraints (`lambda_grad`, `use_freq_weighting`) реализованы
+        НЕ здесь, а в `_BaseReconstructor._aux_loss / _data_loss` через
+        флаги конфигурации — менять форвард не нужно.
+
+    `use_central_fd` сюда НЕ переносится: измеренная SM уже включает
+    конкретную дискретизацию ∂M/∂t своего сканера, и подменить её
+    нельзя — она «зашита» в численные значения матрицы.
+    """
+
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
+                 config: 'PMCNetConfig',
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        super().__init__()
+        self.image_shape = tuple(image_shape)
+        self.config = config
+        self.unet = PMCNetUNet(image_size=self.image_shape,
+                               out_channels=1, base=config.base_channels)
+        self.forward_op = SystemMatrixForward(system_matrix)
+
+        # Опциональная радиальная коррекция p(r), применяется к c до S·c.
+        # Использует ту же `RadialCoilSensitivity`, что и аналитический
+        # форвард, но в виде поэлементного множителя на c.
+        self.use_radial_coil = bool(config.use_radial_coil)
+        if self.use_radial_coil:
+            self.coil_correction = RadialCoilSensitivity(
+                image_size=config.image_size,
+                image_extent_m=config.image_extent_m,
+                coil_radius_m=config.coil_radius_m,
+                learn_radius=config.learn_coil_radius,
+            )
+        else:
+            self.coil_correction = None
+
+        # Опциональный Debye-фильтр поверх S·c в частотной области.
+        # Требует частоты гармоник той же длины, что forward_op.M / 2
+        # (одна частота на бин на каждую из двух катушек).
+        self.use_debye = bool(config.use_debye)
+        if self.use_debye:
+            self.debye = DebyeRelaxationFilter(
+                n_colors=1, init_tau=config.init_tau_seconds,
+            )
+            M = self.forward_op.M
+            if harmonic_frequencies_hz is None:
+                # Резервный путь: гармоники как k * f_drive_x. Это не
+                # совпадает с реальным `frequencySelection`, поэтому
+                # лучше всегда передавать H5-частоты явно из pipeline.
+                freqs = (np.arange(1, M + 1, dtype=np.float32)
+                         * config.drive_frequency_x)
+            else:
+                freqs = np.asarray(harmonic_frequencies_hz,
+                                   dtype=np.float32).flatten()
+                # SM хранит [x-coil | y-coil] по строкам; повторяем
+                # частоты, если дан один набор на катушку.
+                if freqs.size == M // 2:
+                    freqs = np.concatenate([freqs, freqs])
+                if freqs.size != M:
+                    raise ValueError(
+                        f"harmonic_frequencies_hz должен содержать {M} "
+                        f"или {M // 2} элементов (получено {freqs.size})"
+                    )
+            self.register_buffer('debye_freqs_hz',
+                                 torch.tensor(freqs, dtype=torch.float32))
+        else:
+            self.debye = None
+
+    def forward(self, z: torch.Tensor
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        c = self.unet(z)                                       # (B, 1, H, W)
+
+        if self.coil_correction is not None:
+            # Поэлементная коррекция p(r): концентрация × профиль катушки.
+            p = self.coil_correction.sensitivity                 # (H, W)
+            c_corrected = c * p.unsqueeze(0).unsqueeze(0)
+        else:
+            c_corrected = c
+
+        c_flat = c_corrected.view(c_corrected.shape[0], -1)
+        u_real, u_imag = self.forward_op(c_flat)               # (B, M)
+
+        if self.debye is not None:
+            H = self.debye.freq_response(self.debye_freqs_hz, color_idx=0)
+            Hr, Hi = H.real, H.imag
+            # Комплексное умножение в Re/Im-представлении.
+            u_real_new = u_real * Hr - u_imag * Hi
+            u_imag_new = u_real * Hi + u_imag * Hr
+            u_real, u_imag = u_real_new, u_imag_new
+
+        # Возвращаем ИСХОДНОЕ c (без коррекции) — то, что хочется
+        # реконструировать как «истинную концентрацию», а коррекция
+        # катушки — внутреннее свойство форварда.
+        return c, u_real, u_imag
+
+
 # =============================================================================
 # Paper-faithful PMCNet (Huang 2026, Sec. II.B + III.B)
 # =============================================================================
@@ -1698,10 +1801,10 @@ class PMCNetWithBasicPhysics(nn.Module):
       Шаг 6. U(f) = FFT_t{u(t)} для совместимости с pipeline-форматом
                     measurement.
 
-    Что НЕ входит (это сделано в улучшенных моделях):
-      • Радиальная p(r) = 1/(1+(r/R)²) — `PMCNetPhysicsEnhanced`.
-      • Центральная конечная разность через Conv1d — `PMCNetCentralFD`.
-      • Релаксация Дебая (paper Sec. II.C) — `PMCNetDebye`.
+    Что НЕ входит (это в Std-ветке, поверх измеренной SM):
+      • Радиальная p(r) = 1/(1+(r/R)²) — `PMCNetStdRadialCoil`.
+      • Релаксация Дебая (paper Sec. II.C)  — `PMCNetStdDebye`.
+      • Soft penalty / freq-weighted L1     — `PMCNetStdSoft / StdFreqWeighted`.
       • Multi-color (paper Sec. III) — убрано из публичного API.
       • TV-регуляризация — убрано из публичного API (есть в config).
 
@@ -2352,41 +2455,40 @@ def build_analytical_system_matrix(image_shape: Tuple[int, int],
 
 
 # =============================================================================
-# Шесть named-вариантов PMCNet для ablation — pipeline-ready
+# Pipeline-ready варианты PMCNet — Std-ablation + Paper-эталон
 # =============================================================================
 #
-# Все шесть принимают одинаковый формат измерений (комплексный вектор
+# Все варианты принимают одинаковый формат измерений (комплексный вектор
 # гармоник из частотной области, как в `MPIReconstructionComparator`),
 # что позволяет напрямую сравнивать их в одной таблице.
 #
-# Структура: одна общая «база» (PhysicsEnhanced) + три параллельные
-# ветки одиночных улучшений, каждая изолирует один компонент.
+# Структура: Std-baseline + четыре одиночных Std-варианта + PMCNet-All
+# (все улучшения сразу) + отдельный Paper-эталон без матрицы.
 #
-#   1. PMCNetStandard         — paper Huang 2026 в чистом виде с
-#                               ИЗМЕРЕННОЙ системной матрицей сканера
-#                               (без аналитической физики).
+#   1. PMCNetStandard         — Std-baseline: u = S_measured · c, измеренная
+#                               системная матрица сканера, без улучшений.
 #
 #   2. PMCNetPaper            — paper-faithful реализация Eq. 1-3:
-#                               LangevinAdiabatic + uniform p(r) +
-#                               forward-FD ∂/∂t (без улучшений).
+#                               аналитический форвард напрямую из физических
+#                               параметров (без матрицы), без улучшений.
+#                               Отдельная ветка для сравнения «матричный vs
+#                               аналитический форвард».
 #
-#   3. PMCNetPhysicsEnhanced  — БАЗА для веток улучшений: paper-Phys +
-#                               langevin_safe + radial p(r). Forward-FD
-#                               по-прежнему, single color, без Debye.
+#   ─── ablation поверх Std ──────────────────────────────────────────
 #
-#   ─── параллельные ветки от Phys ──────────────────────────────────
+#   3. PMCNetStdRadialCoil    — Std + поэлементная коррекция p(r) на c
+#                               перед S·c.
 #
-#   4. PMCNetSoftConstrained  — Phys + Scheinker 2023 (PCNN): soft
-#                               L2-штраф на ‖∇c‖₂² + freq-weighted L1
-#                               на u. Без изменений forward-оператора.
+#   4. PMCNetStdDebye         — Std + частотный фильтр H_τ(f) поверх S·c
+#                               (обучаемая τ через softplus).
 #
-#   5. PMCNetDebye            — Phys + ОДНО улучшение: релаксация Дебая
-#                               как частотный фильтр H_τ(f) с обучаемой τ
-#                               через softplus.
+#   5. PMCNetStdSoft          — Std + soft penalty λ·‖∇c‖² (prior на
+#                               gradient картинки, Scheinker 2023).
 #
-#   6. PMCNetCentralFD        — Phys + ОДНО улучшение: центральная FD
-#                               через фиксированный Conv1d, O(Δt²)
-#                               вместо O(Δt) у forward-FD (Maxwell-PCNN).
+#   6. PMCNetStdFreqWeighted  — Std + частотно-взвешенный L1 на u_real/u_imag.
+#
+#   7. PMCNetAll              — Std + все 4 улучшения сразу (потолок
+#                               ablation-серии).
 # =============================================================================
 
 
@@ -2477,223 +2579,281 @@ class PMCNetPaper(PMCNetPaperReconstructor):
     pipeline.py) — иначе физика модели и реальности расходятся,
     реконструкция становится бесполезной.
 
-    ## Без улучшений (база для четырёх параллельных веток)
+    ## Без улучшений — paper-эталон
 
-    Этот вариант реализует только базовую физику Eq. 1-3. Четыре
-    параллельных preset'а наследуются от него, каждый добавляя ровно
-    одно улучшение через config-флаг:
-
-      • `PMCNetRadialCoil`  — `use_radial_coil=True`
-      • `PMCNetSoftConstrained` — `lambda_grad=1e-4, use_freq_weighting=True`
-      • `PMCNetDebye`       — `use_debye=True`
-      • `PMCNetCentralFD`   — `use_central_fd=True`
-
-    Все четыре используют тот же `BasicHardConstrainedSpectralForward`
-    с разными значениями флагов в config — структурно они идентичны
-    и отличаются только конфигурацией.
+    Этот вариант реализует только базовую физику Eq. 1-3 и держится в
+    пайплайне как **эталон без матрицы**: показывает, насколько
+    аналитический форвард в принципе способен реконструировать на тех
+    же данных, что и Std-варианты. Ablation-улучшения (radial coil,
+    Debye, soft penalty, freq-weighted L1) применяются НЕ к Paper,
+    а к Std-форварду — см. `PMCNetStdRadialCoil`, `PMCNetStdDebye`,
+    `PMCNetStdSoft`, `PMCNetStdFreqWeighted`, `PMCNetAll`.
     """
 
 
 # =============================================================================
-# Четыре параллельных preset'а на базе PMCNetPaper
+# Конец Paper-блока. Все ablation-улучшения (radial coil, Debye, soft penalty,
+# freq-weighted L1) находятся НИЖЕ в Std-ветке — они применяются поверх
+# измеренной SM, а не поверх аналитической Paper-физики. См. секцию
+# «Std-ветка с улучшениями» дальше в файле.
 # =============================================================================
-# Каждый меняет РОВНО ОДИН config-флаг относительно PMCNet-Paper:
+
+
+# =============================================================================
+# Std-ветка с улучшениями: ИЗМЕРЕННАЯ SM + Debye + radial coil + soft losses
+# =============================================================================
 #
-#   PMCNet-Paper       use_radial_coil=F  use_central_fd=F  use_debye=F  λ_grad=0  freq_w=F
-#   PMCNet-RadialCoil  use_radial_coil=T  use_central_fd=F  use_debye=F  λ_grad=0  freq_w=F
-#   PMCNet-Soft        use_radial_coil=F  use_central_fd=F  use_debye=F  λ_grad>0  freq_w=T
-#   PMCNet-Debye       use_radial_coil=F  use_central_fd=F  use_debye=T  λ_grad=0  freq_w=F
-#   PMCNet-CentralFD   use_radial_coil=F  use_central_fd=T  use_debye=F  λ_grad=0  freq_w=F
+# В отличие от paper-варианта (`PMCNetPaper` и его четырёх потомков),
+# где улучшения накладываются на аналитическую физику, эта ветка
+# поднимает Std-baseline — реальная SM сканера, в которой уже учтены
+# калибровка и неидеальности железа. Std-baseline даёт SSIM ~0.96 на
+# `__sm`-фантомах из коробки; улучшения дают ещё одну ступень качества
+# поверх рабочего фундамента.
 #
-# Все пять наследуются от одного и того же `PMCNetPaperReconstructor`,
-# единственное отличие — это конкретные значения config-флагов. Это
-# идеальный изолированный ablation: каждый «эксперт» отвечает за ровно
-# одну поправку к paper-faithful базе.
+#   PMCNetStandard            — голый baseline: S·c
+#   PMCNetAll                 — Std + Debye + radial coil + soft loss
+#                               (всё что физически совместимо с SM)
 # =============================================================================
 
 
-class PMCNetRadialCoil(PMCNetPaperReconstructor):
-    """PMCNet-Paper + ОДНО улучшение: радиальная чувствительность катушки.
+class PMCNetEnhancedReconstructor(_BaseReconstructor):
+    """Реконструктор для `PMCNetEnhanced` (Std-форвард + улучшения).
 
-    Заменяет uniform p(r) ≡ 1 (paper-faithful) на физически реалистичный
-    профиль `p(r) = 1 / (1 + (|r|/R_coil)²)` — конечный радиус приёмной
-    катушки делает её слабее на краях FOV. Без этой поправки PMCNet
-    переоценивает концентрацию на периферии: модель «думает», что
-    дальние точки производят такой же сигнал, что и центральные.
+    Совместим по API с `PMCNetReconstructor`: принимает измерение в
+    частотной области, выдаёт reconstructed `c` numpy-массив.
 
-    Никаких других изменений относительно `PMCNetPaper`:
-      ▸ Forward-FD для ∂M/∂t (центральная FD — в `PMCNetCentralFD`);
-      ▸ Без Debye-релаксации (— в `PMCNetDebye`);
-      ▸ Без soft-constraints (— в `PMCNetSoftConstrained`);
-      ▸ Loss L1 без частотных весов.
-
-    Прежнее имя класса — `PMCNetPhysicsEnhanced` — содержало в себе
-    одновременно радиальную катушку и `langevin_safe`. Поскольку
-    `langevin_safe` теперь используется во ВСЕХ форвардах (численная
-    необходимость для float32), отличающим компонентом остаётся только
-    радиальная катушка. Переименовано в `PMCNetRadialCoil` для ясности.
+    Soft-constraints (`lambda_grad`, `use_freq_weighting`) подключаются
+    автоматически через `_aux_loss` / `_data_loss` родительского класса —
+    их обработка не зависит от типа форварда.
     """
 
-    def __init__(self, image_shape: Tuple[int, int],
-                 n_meas_bins: int,
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
                  config: Optional[PMCNetConfig] = None,
-                 frequencies_hz: Optional[np.ndarray] = None):
-        base = config or PMCNetConfig(image_size=tuple(image_shape))
-        cfg = PMCNetConfig(**{
-            **base.__dict__,
-            'image_size': tuple(image_shape),
-            # ЕДИНСТВЕННОЕ отличие от Paper:
-            'use_radial_coil': True,
-            # Всё остальное — paper-faithful
-            'use_central_fd': False,
-            'use_debye': False,
-            'lambda_tv': 0.0,
-            'lambda_grad': 0.0,
-            'use_freq_weighting': False,
-            'n_colors': 1,
-        })
-        super().__init__(image_shape, n_meas_bins,
-                         config=cfg, frequencies_hz=frequencies_hz)
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = config or PMCNetConfig(image_size=tuple(image_shape))
+        cfg = PMCNetConfig(**{**cfg.__dict__,
+                              'image_size': tuple(image_shape)})
+        net = PMCNetEnhanced(system_matrix, image_shape, cfg,
+                              harmonic_frequencies_hz=harmonic_frequencies_hz)
+        super().__init__(net, cfg)
+        self.image_shape = tuple(image_shape)
+
+    def reconstruct(self, measurement, n_iterations: Optional[int] = None,
+                    verbose: bool = False, reset: bool = True) -> np.ndarray:
+        n_iter = n_iterations or self.config.n_iterations
+        u_real, u_imag = self._measurement_to_tensors(measurement)
+        M = self.network.forward_op.M
+        if u_real.numel() != M:
+            raise ValueError(
+                f"Измерение содержит {u_real.numel()} бинов, ожидалось {M}."
+            )
+
+        if reset:
+            self._reset_unet_weights()
+            if self.network.use_debye:
+                init_raw = DebyeRelaxationFilter._tau_to_raw(
+                    self.config.init_tau_seconds
+                )
+                with torch.no_grad():
+                    self.network.debye.raw_tau.fill_(init_raw)
+
+        torch.manual_seed(self.config.seed)
+        z = torch.randn(1, 1, *self.image_shape, device=self.device)
+
+        optimizer = torch.optim.Adam(self.network.parameters(),
+                                     lr=self.config.learning_rate)
+        self.loss_history.clear()
+
+        iterator = range(n_iter)
+        if verbose:
+            iterator = tqdm(iterator, desc='PMCNet-Enhanced')
+
+        for it in iterator:
+            optimizer.zero_grad()
+            c, ur, ui = self.network(z)
+            loss = self._data_loss(ur[0], ui[0], u_real, u_imag)
+            loss = loss + self._aux_loss(c)
+            loss.backward()
+            optimizer.step()
+            self.loss_history.append(loss.item())
+            if verbose and (it % max(1, n_iter // 20) == 0):
+                iterator.set_postfix({'loss': f'{loss.item():.4e}'})
+
+        self.network.eval()
+        with torch.no_grad():
+            c, _, _ = self.network(z)
+        self.network.train()
+        return c[0, 0].detach().cpu().numpy()
 
 
-class PMCNetSoftConstrained(PMCNetPaperReconstructor):
-    """PMCNet-Paper + ОДНО улучшение: soft constraints (Scheinker 2023).
+def _std_cfg(base: Optional[PMCNetConfig], image_shape: Tuple[int, int],
+             **overrides) -> PMCNetConfig:
+    """Собрать PMCNetConfig для Std-ветки: paper-флаги выключены, поверх
+    наложены `overrides` для конкретного preset'а.
 
-    Добавляет к paper-faithful базе два auxiliary loss-терма из подхода
-    Scheinker & Pokharel 2023 (APL Mach. Learn., «PCNN for electrodynamics»):
+    Вынесено отдельно, чтобы у всех четырёх одиночных Std-вариантов
+    и у `PMCNetAll` была одна и та же база, отличающаяся только тем,
+    какие именно флаги они переопределяют.
+    """
+    base = base or PMCNetConfig(image_size=tuple(image_shape))
+    flags = {
+        'image_size': tuple(image_shape),
+        # По умолчанию — голый Std-baseline:
+        'use_radial_coil': False,
+        'learn_coil_radius': False,
+        'use_debye': False,
+        'lambda_grad': 0.0,
+        'use_freq_weighting': False,
+        # Не применимо к измеренной SM:
+        'use_central_fd': False,
+        'lambda_tv': 0.0,
+        'n_colors': 1,
+    }
+    flags.update(overrides)
+    return PMCNetConfig(**{**base.__dict__, **flags})
 
-      ▸ **L2-штраф на пространственный градиент**: λ · ‖∇c‖₂² через
-        фиксированное central-FD ядро. В отличие от L1-TV, гладкий
-        штраф мягко гасит мелкомасштабные осцилляции, не выпрямляя
-        границы в ступеньки. Аналог Eq. 12-13 из paper Scheinker.
 
-      ▸ **Частотно-взвешенный L1 на данных**: вес `w_k = (k+1)^0.5`
-        компенсирует затухание амплитуд гармоник MPI как ~1/k —
-        иначе loss доминируется первыми гармониками, а высокие
-        (которые несут разрешение) игнорируются сетью.
+class PMCNetStdRadialCoil(PMCNetEnhancedReconstructor):
+    """Std + ОДНО улучшение: радиальная коррекция концентрации p(r).
 
-    Никаких изменений в forward-операторе — это «чисто loss-level»
-    модификация над paper-faithful физикой. Forward тот же, что у
-    `PMCNetPaper`: uniform p(r), forward-FD, без Debye.
+    Изолирует вклад поэлементной коррекции `p(r) = 1/(1+(r/R)²)`,
+    применяемой к c перед матричным умножением S·c. Эквивалентно
+    предположению: измеренная SM собрана как-будто-идеальной катушкой,
+    а реальный спад на краях FOV учитывается отдельным масштабом на
+    концентрацию. R обучается через softplus(raw_R).
 
-    ## Параметры по умолчанию
-
-      λ_grad = 1e-4, freq_weighting_power = 0.5.
-
-    Подобраны как мягкие: видимый эффект, но без риска разнести
-    реконструкцию.
+    Все остальные улучшения выключены: без Debye, без soft penalty,
+    без freq-weighted L1. Это «чистая» ablation одной поправки.
     """
 
-    def __init__(self, image_shape: Tuple[int, int],
-                 n_meas_bins: int,
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
                  config: Optional[PMCNetConfig] = None,
-                 frequencies_hz: Optional[np.ndarray] = None):
-        base = config or PMCNetConfig(image_size=tuple(image_shape))
-        cfg = PMCNetConfig(**{
-            **base.__dict__,
-            'image_size': tuple(image_shape),
-            # ЕДИНСТВЕННОЕ отличие от Paper: soft-constraints
-            'lambda_grad': 1e-4,
-            'use_freq_weighting': True,
-            'freq_weighting_power': 0.5,
-            # Всё остальное — paper-faithful
-            'use_radial_coil': False,
-            'use_central_fd': False,
-            'use_debye': False,
-            'lambda_tv': 0.0,
-            'n_colors': 1,
-        })
-        super().__init__(image_shape, n_meas_bins,
-                         config=cfg, frequencies_hz=frequencies_hz)
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = _std_cfg(config, image_shape,
+                       use_radial_coil=True,
+                       learn_coil_radius=True)
+        super().__init__(system_matrix, image_shape, config=cfg,
+                         harmonic_frequencies_hz=harmonic_frequencies_hz)
 
 
-class PMCNetDebye(PMCNetPaperReconstructor):
-    """PMCNet-Paper + ОДНО улучшение: релаксация Дебая (обучаемая τ).
+class PMCNetStdDebye(PMCNetEnhancedReconstructor):
+    """Std + ОДНО улучшение: частотный Debye-фильтр H_τ(f) поверх S·c.
 
-    Добавляет к paper-faithful базе фильтр H_τ(f) = 1/(1 + j·2π·f·τ),
-    применяемый к выходу forward в частотной области. Параметр τ
-    обучается совместно с весами сети через `softplus(raw_τ)` —
-    гарантирует положительность по построению.
+    После матричного форварда выход `u_pred = S·c` умножается на
+    H_τ(f) = 1/(1+j·2π·f·τ), где τ — обучаемый параметр через
+    softplus(raw_τ). Это моделирует инерцию намагниченности SPION:
+    реальные частицы не успевают мгновенно за полем, что подавляет
+    высокие гармоники сильнее, чем низкие.
 
-    Физический смысл (paper Eq. 4-5):
-      Намагниченность частиц не следует мгновенно за полем — есть
-      инерция со временем релаксации τ, моделируемая ODE первого
-      порядка: τ · dM_D/dt = −M_D + M. В частотной области это
-      эквивалентно умножению на лоупасс H_τ(f).
-
-    paper Sec. III.B: «we did not provide the magnitude of the
-    relaxation time constant directly, but instead estimated it
-    through the gradient descent algorithm».
-
-    Никаких других изменений относительно PMCNet-Paper:
-      ▸ Uniform p(r) ≡ 1 (радиальная — в `PMCNetRadialCoil`);
-      ▸ Forward-FD (central FD — в `PMCNetCentralFD`);
-      ▸ Loss L1, без soft constraints.
+    Все остальные улучшения выключены: без radial-коррекции, без
+    soft penalty, без freq-weighted L1. Чтобы Debye имел смысл,
+    нужны реальные частоты гармоник из H5 (`harmonic_frequencies_hz`).
     """
 
-    def __init__(self, image_shape: Tuple[int, int],
-                 n_meas_bins: int,
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
                  config: Optional[PMCNetConfig] = None,
-                 frequencies_hz: Optional[np.ndarray] = None):
-        base = config or PMCNetConfig(image_size=tuple(image_shape))
-        cfg = PMCNetConfig(**{
-            **base.__dict__,
-            'image_size': tuple(image_shape),
-            # ЕДИНСТВЕННОЕ отличие от Paper: обучаемая Debye
-            'use_debye': True,
-            # Всё остальное — paper-faithful
-            'use_radial_coil': False,
-            'use_central_fd': False,
-            'lambda_tv': 0.0,
-            'lambda_grad': 0.0,
-            'use_freq_weighting': False,
-            'n_colors': 1,
-        })
-        super().__init__(image_shape, n_meas_bins,
-                         config=cfg, frequencies_hz=frequencies_hz)
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = _std_cfg(config, image_shape, use_debye=True)
+        super().__init__(system_matrix, image_shape, config=cfg,
+                         harmonic_frequencies_hz=harmonic_frequencies_hz)
 
 
-class PMCNetCentralFD(PMCNetPaperReconstructor):
-    """PMCNet-Paper + ОДНО улучшение: центральная разность через Conv1d.
+class PMCNetStdSoft(PMCNetEnhancedReconstructor):
+    """Std + ОДНО улучшение: soft penalty λ·‖∇c‖² на gradient картинки.
 
-    Заменяет forward-FD (`(M[t+1] − M[t])/Δt`, точность O(Δt)) на
-    центральную разность с симметричным ядром `[−1, 0, +1]/(2Δt)`,
-    точность O(Δt²). Реализована как Conv1d с фиксированным
-    (не-обучаемым) ядром — совместима с autograd «бесплатно» и
-    переносима на GPU без ручных циклов (Scheinker 2023, Eq. 12-13).
+    Loss-уровневая регуляризация (Scheinker & Pokharel 2023, PCNN):
+    L2-штраф на пространственный градиент концентрации через central-FD
+    ядро. Гасит мелкомасштабные осцилляции, не выпрямляя границы в
+    ступеньки (в отличие от L1-TV). Forward-оператор не меняется —
+    это «чисто loss-level» поправка.
 
-    Эффект: forward-FD имеет систематический временной сдвиг Δt/2,
-    что в частотной области даёт линейный фазовый сдвиг
-    `exp(−j·π·f·Δt)`. Центральная FD симметрична и не вносит сдвига,
-    давая ровно вдвое лучшую сходимость к точной производной
-    (в пределе Δt → 0 точность ×2).
-
-    Никаких других изменений относительно PMCNet-Paper:
-      ▸ Uniform p(r) ≡ 1 (радиальная — в `PMCNetRadialCoil`);
-      ▸ Без Debye (— в `PMCNetDebye`);
-      ▸ Без soft-constraints (— в `PMCNetSoftConstrained`).
+    Все остальные улучшения выключены: без radial-коррекции, без Debye,
+    без freq-weighted L1. λ_grad = 1e-4 подобрано как мягкое значение,
+    давшее видимый эффект без задавливания деталей.
     """
 
-    def __init__(self, image_shape: Tuple[int, int],
-                 n_meas_bins: int,
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
                  config: Optional[PMCNetConfig] = None,
-                 frequencies_hz: Optional[np.ndarray] = None):
-        base = config or PMCNetConfig(image_size=tuple(image_shape))
-        cfg = PMCNetConfig(**{
-            **base.__dict__,
-            'image_size': tuple(image_shape),
-            # ЕДИНСТВЕННОЕ отличие от Paper: central FD через Conv1d
-            'use_central_fd': True,
-            # Всё остальное — paper-faithful
-            'use_radial_coil': False,
-            'use_debye': False,
-            'lambda_tv': 0.0,
-            'lambda_grad': 0.0,
-            'use_freq_weighting': False,
-            'n_colors': 1,
-        })
-        super().__init__(image_shape, n_meas_bins,
-                         config=cfg, frequencies_hz=frequencies_hz)
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = _std_cfg(config, image_shape, lambda_grad=1e-4)
+        super().__init__(system_matrix, image_shape, config=cfg,
+                         harmonic_frequencies_hz=harmonic_frequencies_hz)
+
+
+class PMCNetStdFreqWeighted(PMCNetEnhancedReconstructor):
+    """Std + ОДНО улучшение: частотно-взвешенный L1 на u_real/u_imag.
+
+    Loss-уровневая модификация data-loss. Каждая гармоника k получает
+    вес w_k = (k+1)^0.5 / ⟨(k+1)^0.5⟩, что компенсирует падение
+    амплитуд гармоник как ~1/k. Без взвешивания низкие гармоники
+    доминируют в loss'е, а высокие (которые несут разрешение)
+    игнорируются оптимизатором → размытая реконструкция.
+
+    Forward-оператор не меняется. Все остальные улучшения выключены:
+    без radial-коррекции, без Debye, без soft penalty.
+    """
+
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
+                 config: Optional[PMCNetConfig] = None,
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = _std_cfg(config, image_shape,
+                       use_freq_weighting=True,
+                       freq_weighting_power=0.5)
+        super().__init__(system_matrix, image_shape, config=cfg,
+                         harmonic_frequencies_hz=harmonic_frequencies_hz)
+
+
+class PMCNetAll(PMCNetEnhancedReconstructor):
+    """PMCNet-Std со ВСЕМИ совместимыми улучшениями одновременно.
+
+    Комбинирует все улучшения, которые ранее по одиночке прикладывались к
+    `PMCNetPaper`, к РАБОЧЕМУ Std-baseline (форвард = измеренная SM сканера):
+
+      ▸ **Radial coil correction** (`use_radial_coil=True`) — p(r) = 1/(1+(r/R)²)
+        как поэлементный множитель на концентрации до S·c. R обучается
+        через softplus, что превращает Std-форвард в blind-calibration по
+        радиусу катушки.
+
+      ▸ **Debye relaxation** (`use_debye=True`) — частотный фильтр
+        H_τ(f) = 1/(1+j·2π·f·τ) поверх S·c. τ обучается через softplus,
+        моделируя инерцию намагниченности SPION.
+
+      ▸ **Soft spatial-gradient penalty** (`lambda_grad=1e-4`) —
+        L2-штраф на ‖∇c‖ через central-FD ядро (Scheinker 2023).
+
+      ▸ **Frequency-weighted L1 loss** (`use_freq_weighting=True`,
+        `freq_weighting_power=0.5`) — взвешивает high-k гармоники,
+        чтобы оптимизатор не игнорировал детали разрешения.
+
+    Зачем все вместе. Раздельные ablation-варианты на Paper-форварде
+    показали SSIM 0.04-0.06 — это нижняя граница, потому что Paper.forward
+    структурно не воспроизводит реальное `S_measured @ c` измерение.
+    Std-форвард совпадает с измерением `__sm`-фантомов по построению
+    (SSIM 0.96 у baseline), и добавление совместимых улучшений сверху
+    даёт прибавку без структурных проблем.
+
+    `use_central_fd` сюда не входит: измеренная SM уже включает свою
+    дискретизацию ∂M/∂t своего сканера — изменить её невозможно.
+    """
+
+    def __init__(self, system_matrix: np.ndarray,
+                 image_shape: Tuple[int, int],
+                 config: Optional[PMCNetConfig] = None,
+                 harmonic_frequencies_hz: Optional[np.ndarray] = None):
+        cfg = _std_cfg(config, image_shape,
+                       use_radial_coil=True,
+                       learn_coil_radius=True,
+                       use_debye=True,
+                       lambda_grad=1e-4,
+                       use_freq_weighting=True,
+                       freq_weighting_power=0.5)
+        super().__init__(system_matrix, image_shape, config=cfg,
+                         harmonic_frequencies_hz=harmonic_frequencies_hz)
 
 
 __all__ = [
@@ -2718,19 +2878,23 @@ __all__ = [
     # U-Net и низкоуровневые модели
     'PMCNetUNet',
     'PMCNet',
+    'PMCNetEnhanced',
     'PMCNetWithBasicPhysics',
     'PMCNetHardConstrained',
     'PMCNetHardConstrainedRefined',
     # Низкоуровневые реконструкторы
     'PMCNetReconstructor',
     'PMCNetPaperReconstructor',
+    'PMCNetEnhancedReconstructor',
     'PMCNetHardConstrainedReconstructor',
     'PMCNetHardConstrainedRefinedReconstructor',
-    # Шесть named-вариантов (pipeline-ready, ablation-структура)
-    'PMCNetStandard',           # SM из калибровки (baseline)
-    'PMCNetPaper',              # paper-faithful (Huang 2026, Eq. 1-3) — общая БАЗА
-    'PMCNetRadialCoil',         # Paper + radial p(r) = 1/(1+(r/R)²)
-    'PMCNetSoftConstrained',    # Paper + Scheinker 2023 soft constraints
-    'PMCNetDebye',              # Paper + Debye-релаксация (обучаемая τ)
-    'PMCNetCentralFD',          # Paper + центральная FD через Conv1d
+    # Pipeline-ready варианты — Std-ablation (улучшения поверх измеренной SM)
+    'PMCNetStandard',           # SM-baseline (без улучшений)
+    'PMCNetStdRadialCoil',      # Std + radial coil correction
+    'PMCNetStdDebye',           # Std + Debye-фильтр на u
+    'PMCNetStdSoft',            # Std + soft penalty λ·‖∇c‖²
+    'PMCNetStdFreqWeighted',    # Std + freq-weighted L1 на u
+    'PMCNetAll',                # Std + все 4 улучшения сразу
+    # Pipeline-ready вариант — Paper (без матрицы, для прямого сравнения)
+    'PMCNetPaper',              # paper-faithful (Huang 2026, Eq. 1-3)
 ]

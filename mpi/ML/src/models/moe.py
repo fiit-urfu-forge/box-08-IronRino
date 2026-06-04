@@ -291,5 +291,83 @@ class MoEReconstructor(nn.Module):
             return F.softmax(self.scalar_logits, dim=0).detach().cpu().numpy()
         return None
 
+    # ---- save / load ---------------------------------------------------------
+    #
+    # Эксперты — внешние callable'ы (часто bound-методы comparator'а или
+    # лямбды, оборачивающие модели). Они НЕ pickle-сериализуются надёжно,
+    # поэтому в чекпойнт пишем только обучаемые параметры gating и
+    # метаданные комбинирования. При загрузке заново передаются те же
+    # эксперты (по именам), а в gating-сеть подкладываются сохранённые
+    # веса.
+
+    def save(self, path: str) -> None:
+        """Сохранить обученное состояние MoE на диск.
+
+        Сохраняются:
+          - режим комбинирования (`mode`),
+          - имена экспертов (для проверки совместимости при load),
+          - размер картинки,
+          - state_dict обучаемой gating-сети / скалярных логитов.
+
+        Args:
+            path: путь к файлу .pt
+        """
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or '.',
+                    exist_ok=True)
+        payload = {
+            'mode': self.mode,
+            'expert_names': list(self.expert_names),
+            'image_shape': tuple(self.image_shape),
+            'state_dict': self.state_dict(),
+        }
+        torch.save(payload, path)
+
+    def load(self, path: str, strict: bool = True) -> None:
+        """Загрузить ранее сохранённое состояние gating.
+
+        Эксперты должны быть переданы в конструктор перед вызовом
+        `load` — здесь подменяются только обучаемые параметры.
+
+        Args:
+            path: путь к файлу, созданному `save`.
+            strict: если True, требовать совпадения mode/expert_names/
+                    image_shape. Если False — только warn'ить.
+        """
+        payload = torch.load(path, map_location=self.device, weights_only=False)
+        saved_mode = payload.get('mode')
+        saved_names = payload.get('expert_names', [])
+        saved_shape = tuple(payload.get('image_shape', ()))
+        if strict:
+            if saved_mode != self.mode:
+                raise ValueError(
+                    f"MoE load: mode mismatch — saved {saved_mode!r}, "
+                    f"current {self.mode!r}"
+                )
+            if list(saved_names) != list(self.expert_names):
+                raise ValueError(
+                    f"MoE load: expert_names mismatch — saved {saved_names}, "
+                    f"current {self.expert_names}"
+                )
+            if saved_shape and saved_shape != tuple(self.image_shape):
+                raise ValueError(
+                    f"MoE load: image_shape mismatch — saved {saved_shape}, "
+                    f"current {self.image_shape}"
+                )
+        else:
+            if saved_mode != self.mode:
+                print(f"  MoE load WARNING: mode mismatch "
+                      f"(saved={saved_mode!r}, current={self.mode!r})")
+            if list(saved_names) != list(self.expert_names):
+                print(f"  MoE load WARNING: expert_names mismatch "
+                      f"(saved={saved_names}, current={self.expert_names})")
+        self.load_state_dict(payload['state_dict'])
+
+    @classmethod
+    def is_saved(cls, path: str) -> bool:
+        """Существует ли файл чекпойнта по `path`."""
+        import os
+        return os.path.isfile(path)
+
 
 __all__ = ['MoEReconstructor']

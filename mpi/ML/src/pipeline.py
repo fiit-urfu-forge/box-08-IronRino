@@ -83,9 +83,11 @@ from .data.phantoms import PhantomType
 from .models import (
     ChaeSingleLayerNN, ChaeMultiLayerNN,
     DeepImagePrior,
-    PMCNetConfig, PMCNetStandard, PMCNetPaper,
-    PMCNetRadialCoil, PMCNetSoftConstrained,
-    PMCNetDebye, PMCNetCentralFD,
+    PMCNetConfig,
+    PMCNetStandard,
+    PMCNetStdRadialCoil, PMCNetStdDebye,
+    PMCNetStdSoft, PMCNetStdFreqWeighted,
+    PMCNetAll, PMCNetPaper,
     MoEReconstructor,
     build_analytical_system_matrix,
 )
@@ -576,69 +578,89 @@ def build_pmcnet_variants(SM, image_shape,
                            n_iterations: int = 3000,
                            init_tau_seconds: float = 1.0e-9,
                            scanner_h5_path: Optional[str] = None):
-    # n_iterations повышен 1500 → 3000: PMCNet-Paper и 4 ветки —
-    # test-time оптимизация со случайно инициализированным U-Net.
-    # На 1500 итерациях loss падает с 0.31 до 0.006, но качество
-    # ещё не доходит до плато (smoke-test показал SSIM 0.49-0.56).
-    # 3000 итераций дают двукратный запас и согласуются с paper
-    # Sec. III.B (20000 итераций — оригинал, но для compute-budget
-    # в дипломе 3000 — разумный компромисс).
-    """Собрать шесть вариантов PMCNet для ablation-сравнения.
+    """Собрать семь вариантов PMCNet для ablation поверх Std-baseline.
 
-    Структура: одна общая «база» (PhysicsEnhanced) + три параллельные
-    ветки одиночных улучшений. Каждая ветка добавляет ровно ОДИН
-    компонент к базовой физике, чтобы можно было независимо оценить его
-    вклад в метрики:
+    Линейка моделей собрана так, чтобы измерить **вклад каждого
+    отдельного улучшения** и **их совместный эффект** на работающем
+    Std-форварде (= измеренная SM сканера). Paper-версия (без матрицы)
+    держится отдельно для прямого сравнения «матричный vs аналитический
+    форвард».
 
-           PMCNet-Std (измеренная SM)
-           PMCNet-Paper (аналитическая, paper-faithful)
-                 │
-                 ▼
-           PMCNet-Phys     ◄── базовая физика (radial p + langevin_safe)
-                 │
-       ┌─────────┼─────────┐
-       ▼         ▼         ▼
-     Soft      Debye    CentralFD
-     (soft     (Debye   (Conv1d
-     loss)    relax.)   ∂/∂t)
+        PMCNet-Std (S_measured · c, baseline)
+              │
+       ┌──────┼──────┬──────────┬─────────────────┐
+       ▼      ▼      ▼          ▼                 ▼
+   StdRadial StdDebye StdSoft  StdFreqW       PMCNet-All
+   (+coil)   (+τ)    (∇c²)    (freq L1)   (все 4 сразу)
+
+        PMCNet-Paper — отдельная ветка: u = BasicAnalyticalForward(c),
+                       без матрицы; единственная модель, считающая
+                       физику напрямую из уравнений.
+
+    Каждая Std-ветка включает РОВНО ОДНО улучшение — это позволяет
+    измерить ablation-вклад каждого компонента в отдельности. PMCNet-All
+    показывает их совместный эффект.
 
     Args:
-        scanner_h5_path: путь к SystemMatrix.h5 (или любому H5 MDF).
-            Если задан, для PMCNet-Paper подгружаются точные физические
-            параметры сканера и явный DFT на frequencySelection.
+        SM: измеренная системная матрица (M, N) complex.
+        image_shape: (Nx, Ny) — размер реконструируемого изображения.
+        n_iterations: число итераций test-time оптимизации (default
+            3000 — компромисс между качеством и compute-budget; paper
+            использует 20000).
+        init_tau_seconds: начальное τ Debye-фильтра. 1e-9 → почти
+            прозрачный фильтр на старте, τ обучается далее.
+        scanner_h5_path: путь к SystemMatrix.h5 (или любому MDF). Если
+            задан, PMCNet-Paper использует реальные параметры сканера и
+            явные H5-частоты для DFT, а StdDebye / All получают частоты
+            гармоник для фильтра H_τ(f).
 
     Returns:
-        Словарь {name: reconstructor} с 6 ключами:
-          'standard', 'paper', 'radial_coil', 'soft', 'debye', 'central_fd'.
-
-    Структура наследования:
-        PMCNetStandard (измеренная SM)         — отдельный baseline
-        PMCNetPaper (paper-faithful)           — общая БАЗА для четырёх
-          ├── PMCNetRadialCoil   (+ radial p(r))
-          ├── PMCNetSoftConstrained (+ Scheinker soft loss)
-          ├── PMCNetDebye        (+ обучаемая τ Debye)
-          └── PMCNetCentralFD    (+ central FD через Conv1d)
-
-    Каждая из четырёх веток включает РОВНО ОДНО улучшение, что даёт
-    чистую ablation: «насколько данное улучшение поднимает метрику
-    относительно paper-faithful базы».
+        Словарь с 7 ключами:
+          'standard', 'std_radial_coil', 'std_debye', 'std_soft',
+          'std_freq_weighted', 'all', 'paper'.
     """
-    print("\n  PMCNet (Huang 2026) — шесть вариантов (data-free) для ablation...")
+    print("\n  PMCNet (Huang 2026) — семь вариантов (data-free) для ablation...")
     base = PMCNetConfig(
         image_size=tuple(image_shape),
         n_iterations=n_iterations,
         learning_rate=1e-3,
         init_tau_seconds=init_tau_seconds,
     )
-    n_meas = int(SM.shape[0])
+
+    # Частоты гармоник из H5: нужны для Debye-фильтра в StdDebye и All.
+    # Без них фильтр использует резервный путь (k·f_drive_x), что не
+    # совпадает с реальной H5-сеткой и снижает качество.
+    h5_freqs_hz = None
+    if scanner_h5_path is not None:
+        try:
+            _scanner = _load_scanner_params_from_h5(scanner_h5_path)
+            h5_freqs_hz = _scanner['frequencies_hz']
+        except (FileNotFoundError, OSError):
+            pass
+
+    # 1) Std-baseline (без улучшений)
     standard = PMCNetStandard(SM, image_shape, config=base)
 
-    # PMCNet-Paper: подгружаем реальные параметры сканера из H5, если дан путь.
-    # Эти параметры применяются КО ВСЕМ четырём наследникам — все они
-    # используют ту же физику, что и Paper.
+    # 2-5) Четыре одиночных Std-варианта — каждая ровно одно улучшение
+    std_radial_coil = PMCNetStdRadialCoil(SM, image_shape, config=base,
+                                           harmonic_frequencies_hz=h5_freqs_hz)
+    std_debye = PMCNetStdDebye(SM, image_shape, config=base,
+                                harmonic_frequencies_hz=h5_freqs_hz)
+    std_soft = PMCNetStdSoft(SM, image_shape, config=base,
+                              harmonic_frequencies_hz=h5_freqs_hz)
+    std_freq_weighted = PMCNetStdFreqWeighted(SM, image_shape, config=base,
+                                               harmonic_frequencies_hz=h5_freqs_hz)
+
+    # 6) PMCNet-All — все 4 улучшения сразу
+    pmcnet_all = PMCNetAll(SM, image_shape, config=base,
+                           harmonic_frequencies_hz=h5_freqs_hz)
+
+    # 7) PMCNet-Paper — отдельная ветка (аналитическая физика, без SM).
+    # Параметры сканера и H5-частоты для DFT подгружаются заново, чтобы
+    # не нарушить базовый config.
     paper_config = base
     paper_freqs = None
-    paper_n_meas = n_meas
+    paper_n_meas = int(SM.shape[0])
     if scanner_h5_path is not None:
         try:
             scanner = _load_scanner_params_from_h5(scanner_h5_path)
@@ -655,33 +677,23 @@ def build_pmcnet_variants(SM, image_shape,
             print(f"    [Paper] ⚠ не удалось прочитать {scanner_h5_path}: {e}")
             print(f"    [Paper] используются config-дефолты")
     paper = PMCNetPaper(image_shape, paper_n_meas, config=paper_config,
-                         frequencies_hz=paper_freqs)
-
-    # Четыре параллельных ветки — все используют paper_config и paper_freqs,
-    # отличаются только своим конкретным флагом-улучшением.
-    radial_coil = PMCNetRadialCoil(image_shape, paper_n_meas,
-                                    config=paper_config,
-                                    frequencies_hz=paper_freqs)
-    soft = PMCNetSoftConstrained(image_shape, paper_n_meas,
-                                  config=paper_config,
-                                  frequencies_hz=paper_freqs)
-    debye = PMCNetDebye(image_shape, paper_n_meas,
-                        config=paper_config,
                         frequencies_hz=paper_freqs)
-    central_fd = PMCNetCentralFD(image_shape, paper_n_meas,
-                                  config=paper_config,
-                                  frequencies_hz=paper_freqs)
 
-    print(f"    1) Standard     (SM-baseline — НЕ из paper)")
-    print(f"    2) Paper [база] (paper-faithful, Huang 2026 Eq. 1-3)")
-    print(f"    3) RadialCoil   ← Paper + p(r) = 1/(1+(r/R)²)")
-    print(f"    4) Soft         ← Paper + Scheinker 2023 soft (‖∇c‖₂² + freq-weighted L1)")
-    print(f"    5) Debye        ← Paper + релаксация Дебая (обучаемая τ)")
-    print(f"    6) CentralFD    ← Paper + центральная FD через Conv1d (O(Δt²))")
+    print(f"    1) Std              (SM-baseline, без улучшений)")
+    print(f"    2) Std + RadialCoil ← поэлементная коррекция p(r) = 1/(1+(r/R)²)")
+    print(f"    3) Std + Debye      ← частотный фильтр H_τ(f) поверх S·c")
+    print(f"    4) Std + Soft       ← soft penalty λ·‖∇c‖²")
+    print(f"    5) Std + FreqW L1   ← частотно-взвешенный L1 на u")
+    print(f"    6) Std + All        ← все 4 улучшения вместе")
+    print(f"    7) Paper            (физика напрямую, без матрицы)")
     return {
-        'standard': standard, 'paper': paper,
-        'radial_coil': radial_coil, 'soft': soft,
-        'debye': debye, 'central_fd': central_fd,
+        'standard': standard,
+        'std_radial_coil': std_radial_coil,
+        'std_debye': std_debye,
+        'std_soft': std_soft,
+        'std_freq_weighted': std_freq_weighted,
+        'all': pmcnet_all,
+        'paper': paper,
     }
 
 
@@ -702,7 +714,10 @@ def build_moe(comparator, image_shape,
                             'CNN', 'MoDL', 'DIP(2020)'),
               n_train_samples: int = 64,
               epochs: int = 30,
-              mode: str = 'spatial'):
+              mode: str = 'spatial',
+              save_path: Optional[str] = None,
+              load_if_exists: bool = True,
+              tag: str = 'MoE'):
     """Собрать MoE поверх уже привязанных к comparator'у экспертов.
 
     Шаги:
@@ -747,10 +762,12 @@ def build_moe(comparator, image_shape,
     должны совпадать с теми, что в таблице сравнения.
     """
     print("\n" + "=" * 70)
-    print(f"2.5. MIXTURE OF EXPERTS — комбинирование ({len(expert_names)} экспертов)")
+    print(f"2.5. {tag} — комбинирование ({len(expert_names)} экспертов)")
     print("=" * 70)
     print(f"  Эксперты: {list(expert_names)}")
     print(f"  Режим комбинирования: {mode!r}")
+    if save_path:
+        print(f"  Чекпойнт: {save_path}")
 
     # Достаём callable'ы из текущего comparator
     name_to_callable = {
@@ -763,10 +780,12 @@ def build_moe(comparator, image_shape,
         'MoDL': comparator.modl_reconstruction,
         'Diffusion': comparator.diffusion_reconstruction,
         'PMCNet-Std(2026)': comparator.pmcnet_standard_reconstruction,
-        'PMCNet-RadialCoil(2026)': comparator.pmcnet_radial_coil_reconstruction,
-        'PMCNet-Soft(2026)': comparator.pmcnet_soft_reconstruction,
-        'PMCNet-Debye(2026)': comparator.pmcnet_debye_reconstruction,
-        'PMCNet-CentralFD(2026)': comparator.pmcnet_central_fd_reconstruction,
+        'PMCNet-Std+RadialCoil(2026)': comparator.pmcnet_std_radial_coil_reconstruction,
+        'PMCNet-Std+Debye(2026)': comparator.pmcnet_std_debye_reconstruction,
+        'PMCNet-Std+Soft(2026)': comparator.pmcnet_std_soft_reconstruction,
+        'PMCNet-Std+FreqW(2026)': comparator.pmcnet_std_freq_weighted_reconstruction,
+        'PMCNet-All(2026)': comparator.pmcnet_all_reconstruction,
+        'PMCNet-Paper(2026)': comparator.pmcnet_paper_reconstruction,
     }
     experts = {}
     for n in expert_names:
@@ -791,21 +810,47 @@ def build_moe(comparator, image_shape,
         device='cuda' if torch.cuda.is_available() else 'cpu',
     )
 
-    # Прекомпьют выходов экспертов на n_train_samples образцов
-    n_use = min(n_train_samples, len(X_train))
-    idx = np.random.choice(len(X_train), n_use, replace=False)
-    measurements_subset = [X_train[i] for i in idx]
-    targets_subset = torch.tensor(y_train[idx], dtype=torch.float32)
-    print(f"\n  Прекомпьют выходов экспертов на {n_use} образцах...")
-    expert_recons = moe.precompute_expert_recons(
-        measurements_subset, show_progress=True)
+    # Попытка загрузить сохранённый чекпойнт gating'а перед обучением.
+    # Если набор экспертов / режим совпадают — пропускаем обучение.
+    loaded_from_disk = False
+    if save_path is not None and load_if_exists and MoEReconstructor.is_saved(save_path):
+        try:
+            moe.load(save_path, strict=True)
+            loaded_from_disk = True
+            print(f"  Загружено состояние gating из {save_path} — "
+                  f"обучение пропущено")
+        except (ValueError, RuntimeError) as e:
+            print(f"  ⚠ Чекпойнт {save_path} не подошёл ({e}); переобучаем")
 
-    # Обучение gating
-    if mode != 'mean':
-        print(f"\n  Обучение gating ({mode}, {epochs} эпох)...")
-        moe.train_gating(expert_recons, targets_subset,
-                         epochs=epochs, lr=1e-3, batch_size=8,
-                         verbose=True)
+    if not loaded_from_disk:
+        # Прекомпьют выходов экспертов на n_train_samples образцов
+        n_use = min(n_train_samples, len(X_train))
+        idx = np.random.choice(len(X_train), n_use, replace=False)
+        measurements_subset = [X_train[i] for i in idx]
+        targets_subset = torch.tensor(y_train[idx], dtype=torch.float32)
+        print(f"\n  Прекомпьют выходов экспертов на {n_use} образцах...")
+        expert_recons = moe.precompute_expert_recons(
+            measurements_subset, show_progress=True)
+
+        # Обучение gating
+        if mode != 'mean':
+            print(f"\n  Обучение gating ({mode}, {epochs} эпох)...")
+            moe.train_gating(expert_recons, targets_subset,
+                             epochs=epochs, lr=1e-3, batch_size=8,
+                             verbose=True)
+
+        if save_path is not None:
+            moe.save(save_path)
+            print(f"  Сохранено состояние gating в {save_path}")
+    else:
+        # Для diagnostic-блока ниже нужны expert_recons и targets_subset.
+        n_use = min(n_train_samples, len(X_train))
+        idx = np.random.choice(len(X_train), n_use, replace=False)
+        measurements_subset = [X_train[i] for i in idx]
+        targets_subset = torch.tensor(y_train[idx], dtype=torch.float32)
+        print(f"\n  Прекомпьют выходов экспертов на {n_use} образцах (для diagnostic)...")
+        expert_recons = moe.precompute_expert_recons(
+            measurements_subset, show_progress=True)
 
     # Diagnostic: разница MSE между лучшим индивидуальным экспертом
     # и MoE-комбинированием на этой же выборке
@@ -874,26 +919,30 @@ def _load_scanner_params_from_h5(path: str) -> dict:
     }
 
 
-def _load_real_measurement_b(
-        path: str = './../ChineseData/BeihangUniversityData/MeasurementData_B.h5'
+def _load_real_measurement(
+        letter: str,
+        beihang_dir: str = './../ChineseData/BeihangUniversityData',
 ) -> np.ndarray:
-    """Загрузить РЕАЛЬНОЕ измерение фантома 'B' из BeihangUniversityData.
+    """Загрузить РЕАЛЬНОЕ измерение фантома `letter` из BeihangUniversityData.
 
-    Файл MeasurementData_B.h5 — это MDF-формат с измеренным сигналом со
-    сканера (не изображение фантома). Содержит частотные гармоники в полях
-    `measurement/data/r` (real) и `measurement/data/i` (imaginary), форма
-    `(2, 1275)` — две катушки × 1275 гармоник, что точно совпадает с
-    SystemMatrix.h5.
+    Файлы MeasurementData_<letter>.h5 — это MDF-формат с измеренным сигналом
+    со сканера (не изображение фантома). Содержат частотные гармоники в
+    полях `measurement/data/r` (real) и `measurement/data/i` (imaginary),
+    форма `(2, 1275)` — две катушки × 1275 гармоник, что точно совпадает
+    с SystemMatrix.h5.
 
     Args:
-        path: путь к .h5 файлу. По умолчанию относительный от cwd `mpi/ML`.
+        letter: 'A', 'B' или 'U' — буква, под которую снят MDF.
+        beihang_dir: путь к каталогу с MeasurementData_*.h5.
 
     Returns:
-        complex64 массив формы (2, M_per_coil), готовый к подаче
-        в `comparator.compare_all_methods_on_image` через поле
-        `measurement` battery-словаря.
+        complex64 массив формы (2, M_per_coil), готовый к подаче в
+        `comparator.compare_all_methods_on_image` через поле `measurement`
+        battery-словаря.
     """
     import h5py
+    letter_up = letter.upper()
+    path = f'{beihang_dir}/MeasurementData_{letter_up}.h5'
     with h5py.File(path, 'r') as f:
         re = f['measurement/data/r'][:]            # (2, 1275) float64
         im = f['measurement/data/i'][:]
@@ -904,6 +953,68 @@ def _load_real_measurement_b(
             )
     measurement = (re + 1j * im).astype(np.complex64)
     return measurement
+
+
+# Обратная совместимость со старым именем (используется в notebooks/тестах).
+def _load_real_measurement_b(
+        path: str = './../ChineseData/BeihangUniversityData/MeasurementData_B.h5'
+) -> np.ndarray:
+    """Загрузить реальное измерение фантома 'B'. См. `_load_real_measurement`."""
+    import os
+    beihang_dir = os.path.dirname(path) or '.'
+    return _load_real_measurement('B', beihang_dir=beihang_dir)
+
+
+def _letter_phantom_from_h5(letter: str, SM_measured: np.ndarray,
+                            image_shape, mu: float = 1e-2,
+                            beihang_dir: str = './../ChineseData/BeihangUniversityData'
+                            ) -> np.ndarray:
+    """Восстановить фантом-букву ИЗ ФАЙЛА сканера через Tikhonov-реконструкцию.
+
+    В H5-файле `MeasurementData_<letter>.h5` хранится только частотное
+    измерение со сканера (1275 комплексных гармоник × 2 катушки), но не
+    изображение буквы. Чтобы получить «фантом из файла», восстанавливаем
+    его из реального измерения линейным алгоритмом Тихонова:
+
+        c̃ = (S* S + μI)⁻¹ S* u_meas,        ‖S‖ ≤ 1 после нормировки
+
+    Это data-derived фантом: каждый пиксель приходит из реального сигнала
+    сканера, а не из ручного рисунка контура. Качество восстановления —
+    как у baseline Tikhonov на real-data: грубые контуры буквы, без
+    деталей. Этого достаточно для approximate ground truth.
+
+    Альтернативу с другими baseline'ами (KatsMarc, CNN) делать не стали:
+    Tikhonov — наиболее стабильный и не требует обучения, что подходит
+    под роль reference-фантома.
+
+    Args:
+        letter: 'A', 'B' или 'U'.
+        SM_measured: системная матрица сканера (M, N) complex.
+        image_shape: (Nx, Ny) — размер реконструируемой картинки.
+        mu: коэффициент регуляризации Тихонова. 1e-2 — мягкая
+            регуляризация, оптимизированная под Beihang-сканер
+            (см. tune_tikhonov_mu).
+        beihang_dir: путь к каталогу с MeasurementData_*.h5.
+
+    Returns:
+        (Nx, Ny) float32, нормированный на [0, 1].
+    """
+    from .models import TikhonovReconstructor
+    meas = _load_real_measurement(letter, beihang_dir=beihang_dir)
+    M_total = int(SM_measured.shape[0])
+    M_per_coil = M_total // 2
+    if meas.shape[1] != M_per_coil:
+        meas = meas[:, :M_per_coil]
+    rec = TikhonovReconstructor(SM_measured)
+    image = rec.reconstruct(meas, mu=mu)
+    image = np.asarray(image, dtype=np.float32).reshape(image_shape)
+    # Нормировка в [0, 1] — для согласования со всеми остальными
+    # фантомами в батарее.
+    if image.max() > image.min():
+        image = (image - image.min()) / (image.max() - image.min())
+    else:
+        image = np.zeros_like(image, dtype=np.float32)
+    return image.astype(np.float32)
 
 
 def build_phantom_battery(SM_measured, image_shape,
@@ -1007,37 +1118,51 @@ def build_phantom_battery(SM_measured, image_shape,
                              'generation_method': method_name},
             })
 
-    # letter_B — реальное измерение из H5, ground truth через приближение
-    print(f"  Загрузка реального измерения фантома 'B' из H5...")
-    try:
-        real_b_meas = _load_real_measurement_b()
-        # Ground truth для метрик: приближённое изображение по дизайну
-        # фантома (точная форма B известна, но изображения со сканера нет)
-        gt_b_approx = pg.letter_phantom('B')
-        # Согласование размерностей measurement и SM: H5-файл может иметь
-        # больше частотных бинов, чем SM_measured (1275 vs M_total/2).
-        M_per_coil = M_total // 2
-        if real_b_meas.shape[1] != M_per_coil:
-            # Берём первые M_per_coil гармоник (низкочастотные несут основную
-            # энергию реконструкции; высокие частоты вне SM-сетки не нужны)
-            real_b_meas = real_b_meas[:, :M_per_coil]
-            print(f"    обрезано до {M_per_coil} гармоник на катушку, "
-                  f"чтобы совпало с SM_measured ({M_total} полных бинов)")
-        battery.append({
-            'label': 'letter_B__real',
-            'image': gt_b_approx,            # ground truth approx для SSIM
-            'measurement': real_b_meas,       # РЕАЛЬНОЕ измерение со сканера
-            'metadata': {'phantom_type': 'letter_B',
-                         'generation_method': 'real'},
-        })
-        print(f"    letter_B измерение: {real_b_meas.shape} complex64 (со сканера)")
-    except (FileNotFoundError, OSError) as e:
-        print(f"  ⚠ Не удалось загрузить MeasurementData_B.h5: {e}")
-        print(f"    letter_B пропущен (только синтетические фантомы)")
+    # letter_A, letter_B, letter_U — реальные измерения из H5-файлов сканера.
+    # Сами H5-файлы хранят ТОЛЬКО сигнал во частотной области, не
+    # изображение фантома. Чтобы получить data-derived GT для метрик
+    # (SSIM/PSNR требуют пару (GT, recon)), восстанавливаем «фантом»
+    # классическим Тихоновым на измеренной SM — см. _letter_phantom_from_h5.
+    # Это не рисованный контур: каждый пиксель приходит из реального
+    # сигнала сканера.
+    M_per_coil = M_total // 2
+    real_letters = ('A', 'B', 'U')
+    real_added = []
+    for letter in real_letters:
+        print(f"  Загрузка реального измерения фантома '{letter}' из H5...")
+        try:
+            meas = _load_real_measurement(letter)
+            if meas.shape[1] != M_per_coil:
+                # Согласование размерности: H5 может иметь больше гармоник,
+                # чем SM_measured. Берём первые M_per_coil низкочастотных.
+                meas = meas[:, :M_per_coil]
+                print(f"    обрезано до {M_per_coil} гармоник на катушку, "
+                      f"чтобы совпало с SM_measured ({M_total} полных бинов)")
+            # GT-фантом восстанавливается из РЕАЛЬНОГО измерения через
+            # Тихонов на той же SM_measured. Это базовый data-derived
+            # reference: качество как у Tikhonov-baseline, без обучения,
+            # стабильный по всем буквам.
+            gt_letter = _letter_phantom_from_h5(
+                letter, SM_measured, image_shape,
+            )
+            battery.append({
+                'label': f'letter_{letter}__real',
+                'image': gt_letter,             # data-derived reference из H5
+                'measurement': meas,
+                'metadata': {'phantom_type': f'letter_{letter}',
+                             'generation_method': 'real',
+                             'gt_source': 'tikhonov_recon_of_h5'},
+            })
+            print(f"    letter_{letter}: измерение {meas.shape} complex64, "
+                  f"GT (Tikhonov-recon) {gt_letter.shape}")
+            real_added.append(letter)
+        except (FileNotFoundError, OSError) as e:
+            print(f"  ⚠ Не удалось загрузить MeasurementData_{letter}.h5: {e}")
+            print(f"    letter_{letter} пропущен")
 
     print(f"  Готово: {len(battery)} экспериментов "
           f"({len(synthetic_phantoms)} синтетических × 2 пути "
-          f"+ letter_B на реальном сигнале)")
+          f"+ {len(real_added)} реальных букв: {', '.join(real_added) or '—'})")
     return battery
 
 
@@ -1156,11 +1281,12 @@ def run_pipeline(num_samples: int = 5000, train_models: bool = True,
     cmp.set_chae_multi_model(chae_multi)
     cmp.set_dip_model(dip)
     cmp.set_pmcnet_standard(pmcnet_variants['standard'])
+    cmp.set_pmcnet_std_radial_coil(pmcnet_variants['std_radial_coil'])
+    cmp.set_pmcnet_std_debye(pmcnet_variants['std_debye'])
+    cmp.set_pmcnet_std_soft(pmcnet_variants['std_soft'])
+    cmp.set_pmcnet_std_freq_weighted(pmcnet_variants['std_freq_weighted'])
+    cmp.set_pmcnet_all(pmcnet_variants['all'])
     cmp.set_pmcnet_paper(pmcnet_variants['paper'])
-    cmp.set_pmcnet_radial_coil(pmcnet_variants['radial_coil'])
-    cmp.set_pmcnet_soft(pmcnet_variants['soft'])
-    cmp.set_pmcnet_debye(pmcnet_variants['debye'])
-    cmp.set_pmcnet_central_fd(pmcnet_variants['central_fd'])
 
     # 2.4) Cross-validation параметра μ для Tikhonov на этом наборе
     best_mu = tune_tikhonov_mu(SM, X_train, y_train,
@@ -1168,20 +1294,46 @@ def run_pipeline(num_samples: int = 5000, train_models: bool = True,
                                 kmax=20, n_val_samples=12)
     cmp.set_tikhonov_mu(best_mu)
 
-    # 2.5) MoE поверх отобранных экспертов
-    # expert_names НЕ задаём явно — используем default из build_moe:
-    # ('Тихонов', 'Chae-Multi(2017)', 'CNN', 'MoDL', 'DIP(2020)').
-    # См. docstring build_moe — там же мотивация отбора каждой модели.
-    moe = build_moe(
+    # 2.5) Две MoE-сборки, обучение сохраняется на диск.
+    #
+    # MoE-Classical: дешёвые классические/обучаемые методы без явной
+    # физики измерения. Каждый эксперт быстрый (<10 сек/сэмпл) →
+    # прекомпьют 128 образцов укладывается в ~15 минут.
+    #
+    # MoE-Hybrid: гибридные физико-обучаемые методы. MoDL + PMCNet-All
+    # оба используют системную матрицу в своём forward-операторе, что
+    # даёт лучшую устойчивость к out-of-distribution данным (вроде
+    # реальных букв со сканера). PMCNet-All — test-time оптимизация,
+    # ~30-60 сек/сэмпл, поэтому n_train_samples здесь меньше.
+    moe_classical = build_moe(
         comparator=cmp,
         image_shape=image_shape,
         X_train=X_train, y_train=y_train,
-        n_train_samples=128,
+        expert_names=('Тихонов', 'DIP(2020)', 'Chae-Multi(2017)'),
+        n_train_samples=64,
         epochs=80,
         mode='spatial',
+        save_path='./DATA/models/moe_classical.pt',
+        load_if_exists=not train_models,
+        tag='MoE-Classical',
     )
-    if moe is not None:
-        cmp.set_moe(moe)
+    if moe_classical is not None:
+        cmp.set_moe_classical(moe_classical)
+
+    moe_hybrid = build_moe(
+        comparator=cmp,
+        image_shape=image_shape,
+        X_train=X_train, y_train=y_train,
+        expert_names=('MoDL', 'PMCNet-All(2026)'),
+        n_train_samples=16,
+        epochs=60,
+        mode='spatial',
+        save_path='./DATA/models/moe_hybrid.pt',
+        load_if_exists=not train_models,
+        tag='MoE-Hybrid',
+    )
+    if moe_hybrid is not None:
+        cmp.set_moe_hybrid(moe_hybrid)
 
     # 3) Батарея фантомов × методов генерации
     battery = build_phantom_battery(
